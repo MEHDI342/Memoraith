@@ -1,0 +1,2 @@
+__init__.py:1:0 - error while code parsing: Unable to load file C:\Users\PC\Desktop\Leo-Major\Memoraith\__init__.py:
+[Errno 2] No such file or directory: 'C:\\Users\\PC\\Desktop\\Leo-Major\\Memoraith\\__init__.py' [parse-error] (Fatal)
