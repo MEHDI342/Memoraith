@@ -12,13 +12,13 @@ def generate_project_structure(directory, indent_level=0):
         structure += f"{indent}├── {os.path.basename(root)}/\n"
         sub_indent = '│   ' * (level + 1 - indent_level)
         for file in files:
-            structure += f"{sub_indent}├── {file}\n"
+            if file.endswith('.py'):
+                structure += f"{sub_indent}├── {file}\n"
         dirs[:] = [d for d in dirs if d != 'venv']  # Skip venv directory
 
     return structure
 
 def extract_classes_and_methods(content):
-    # Regular expressions to capture class and method definitions in Python files
     class_regex = r'class\s+(\w+)\s*(\(.*?\))?:'
     method_regex = r'def\s+(\w+)\s*\(.*?\):'
 
@@ -30,7 +30,6 @@ def extract_classes_and_methods(content):
         extracted_content += f"\nClass: {class_name}\n"
         extracted_content += "-" * 80 + "\n"
 
-        # Now, extract methods inside the class
         method_matches = re.findall(method_regex, content)
         for method_match in method_matches:
             extracted_content += f"  Method: {method_match}\n"
@@ -44,28 +43,26 @@ def read_files_recursively(directory):
             continue
 
         for file in files:
-            file_path = os.path.join(root, file)
-            print(f"Processing file: {file_path}")
-            content += f"File: {file_path}\n\n"
-            try:
-                # Attempt to read every file as a text file
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    file_content = f.read()
-                    content += file_content
+            if file.endswith('.py'):
+                file_path = os.path.join(root, file)
+                print(f"Processing file: {file_path}")
+                content += f"File: {file_path}\n\n"
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        file_content = f.read()
+                        content += file_content
 
-                    # If it's a Python file, extract class and method definitions
-                    if file.endswith('.py'):
                         extracted_classes_methods = extract_classes_and_methods(file_content)
                         content += extracted_classes_methods
 
-            except UnicodeDecodeError:
-                try:
-                    with open(file_path, 'r', encoding='ISO-8859-1') as f:
-                        file_content = f.read()
-                        content += file_content
-                except Exception as e:
-                    content += f"Error reading file: {e}"
-            content += "\n\n" + "-"*80 + "\n\n"
+                except UnicodeDecodeError:
+                    try:
+                        with open(file_path, 'r', encoding='ISO-8859-1') as f:
+                            file_content = f.read()
+                            content += file_content
+                    except Exception as e:
+                        content += f"Error reading file: {e}"
+                content += "\n\n" + "-"*80 + "\n\n"
     return content
 
 def save_content_to_txt(directory, output_file):
