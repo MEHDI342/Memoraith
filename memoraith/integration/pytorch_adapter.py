@@ -1,283 +1,612 @@
 import torch
-import logging
-from typing import Dict, Any, List, Optional
-import asyncio
+import torch.nn as nn
+from torch.autograd import Variable
+import torch.cuda.nvtx as nvtx
+import psutil
+import threading
 import time
-from .framework_adapter import FrameworkAdapter
-from ..data_collection import TimeTracker, CPUMemoryTracker, GPUMemoryTracker
-from ..config import config
+import logging
+from typing import Dict, Any, List, Optional, Tuple, Set
+from enum import Enum
+from dataclasses import dataclass
+import numpy as np
+from pathlib import Path
+import json
+import queue
+from collections import defaultdict
 
-class PyTorchAdapter(FrameworkAdapter):
-    """Complete adapter for integrating with PyTorch models."""
+class ProfilingLevel(Enum):
+    BASIC = "basic"          # Basic metrics only
+    MEMORY = "memory"        # Memory-focused profiling
+    COMPUTE = "compute"      # Computation-focused profiling
+    FULL = "full"           # All metrics and features
 
-    def __init__(self, model: torch.nn.Module):
-        super().__init__(model)
-        self.time_tracker = TimeTracker()
-        self.cpu_tracker = CPUMemoryTracker()
-        self.gpu_tracker = GPUMemoryTracker() if torch.cuda.is_available() and config.enable_gpu else None
-        self.handles: List[torch.utils.hooks.RemovableHandle] = []
+@dataclass
+class LayerProfile:
+    """Detailed layer profiling information"""
+    name: str
+    layer_type: str
+    input_shape: Tuple
+    output_shape: Tuple
+    parameters: int
+    cpu_memory: float
+    gpu_memory: float
+    compute_time: float
+    flops: int
+    backward_time: float
+    gradient_norm: float
+    activation_memory: float
+    buffer_memory: float
+    cuda_memory_allocated: float
+    cuda_memory_cached: float
+    cuda_utilization: float
+    peak_memory: float
+
+class PyTorchAdapter:
+    """Advanced PyTorch model profiling adapter"""
+
+    def __init__(
+            self,
+            model: nn.Module,
+            level: ProfilingLevel = ProfilingLevel.FULL,
+            log_dir: str = "profiling_logs",
+            device: Optional[torch.device] = None
+    ):
+        self.model = model
+        self.level = level
+        self.log_dir = Path(log_dir)
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Setup logging
         self.logger = logging.getLogger(__name__)
-        self.device = torch.device("cuda" if torch.cuda.is_available() and config.enable_gpu else "cpu")
+        self._setup_logging()
+
+        # Profiling data structures
+        self.layer_profiles: Dict[str, LayerProfile] = {}
+        self.training_history: List[Dict[str, float]] = []
+        self.memory_traces: Dict[str, List[float]] = defaultdict(list)
+        self.gradient_history: Dict[str, List[float]] = defaultdict(list)
+        self.activation_maps: Dict[str, List[torch.Tensor]] = {}
+        self.bottlenecks: Set[str] = set()
+
+        # Performance monitoring
+        self._monitoring_queue = queue.Queue()
+        self._stop_monitoring = threading.Event()
+        self._monitoring_thread: Optional[threading.Thread] = None
+
+        # CUDA events for precise timing
+        self.cuda_events: Dict[str, torch.cuda.Event] = {}
+
+        # Move model to device
         self.model.to(self.device)
+        self._attach_hooks()
+        self.logger.info(f"PyTorch adapter initialized with profiling level: {level.value}")
 
-    async def start_profiling(self) -> None:
-        """Start profiling by registering hooks."""
+    def _setup_logging(self) -> None:
+        """Configure detailed logging"""
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(self.log_dir / "pytorch_profiling.log")
+        fh.setLevel(logging.DEBUG)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        fh.setFormatter(formatter)
+        self.logger.addHandler(fh)
+        self.logger.setLevel(logging.DEBUG)
+
+    def _attach_hooks(self) -> None:
+        """Attach comprehensive profiling hooks to model"""
         for name, module in self.model.named_modules():
-            if len(list(module.children())) == 0:  # Only leaf modules
-                pre_handle = module.register_forward_pre_hook(self._pre_forward_hook)
-                post_handle = module.register_forward_hook(self._forward_hook)
-                self.handles.extend([pre_handle, post_handle])
+            # Forward pre-hook for input analysis
+            module.register_forward_pre_hook(self._forward_pre_hook(name))
 
-        await self.cpu_tracker.start()
-        if self.gpu_tracker:
-            await self.gpu_tracker.start()
+            # Forward hook for output analysis
+            module.register_forward_hook(self._forward_hook(name))
 
-    async def stop_profiling(self) -> None:
-        """Remove hooks after profiling."""
-        for handle in self.handles:
-            handle.remove()
-        self.handles.clear()
+            # Backward hook for gradient analysis
+            if hasattr(module, 'weight') and module.weight is not None:
+                module.register_full_backward_hook(self._backward_hook(name))
 
-        await self.cpu_tracker.stop()
-        if self.gpu_tracker:
-            await self.gpu_tracker.stop()
+            self.cuda_events[f"{name}_forward_start"] = torch.cuda.Event(enable_timing=True)
+            self.cuda_events[f"{name}_forward_end"] = torch.cuda.Event(enable_timing=True)
+            self.cuda_events[f"{name}_backward_start"] = torch.cuda.Event(enable_timing=True)
+            self.cuda_events[f"{name}_backward_end"] = torch.cuda.Event(enable_timing=True)
 
-    async def _forward_hook(self, module: torch.nn.Module, input: Any, output: Any) -> None:
-        layer_name = f"{module.__class__.__name__}_{id(module)}"
-        self.time_tracker.stop(layer_name)
+    def _forward_pre_hook(self, name: str):
+        """Pre-forward pass hook for input analysis"""
+        def hook(module: nn.Module, input: Tuple[torch.Tensor]):
+            if self.level != ProfilingLevel.BASIC:
+                try:
+                    # Start CUDA timing
+                    event = self.cuda_events[f"{name}_forward_start"]
+                    event.record()
 
+                    # Record input statistics
+                    if input[0].requires_grad:
+                        input_size = input[0].element_size() * input[0].nelement()
+                        self.memory_traces[f"{name}_input"].append(input_size)
+
+                    # CUDA memory tracking
+                    if torch.cuda.is_available():
+                        self._record_cuda_memory(name, "pre_forward")
+
+                except Exception as e:
+                    self.logger.error(f"Error in forward pre-hook for {name}: {str(e)}")
+        return hook
+
+    def _forward_hook(self, name: str):
+        """Post-forward pass hook for comprehensive analysis"""
+        def hook(module: nn.Module, input: Tuple[torch.Tensor], output: torch.Tensor):
+            try:
+                # End CUDA timing
+                event_start = self.cuda_events[f"{name}_forward_start"]
+                event_end = self.cuda_events[f"{name}_forward_end"]
+                event_end.record()
+
+                # Basic metrics
+                profile = LayerProfile(
+                    name=name,
+                    layer_type=module.__class__.__name__,
+                    input_shape=tuple(input[0].shape),
+                    output_shape=tuple(output.shape) if isinstance(output, torch.Tensor) else None,
+                    parameters=sum(p.numel() for p in module.parameters() if p.requires_grad),
+                    cpu_memory=0,
+                    gpu_memory=0,
+                    compute_time=0,
+                    flops=self._calculate_flops(module, input[0], output),
+                    backward_time=0,
+                    gradient_norm=0,
+                    activation_memory=0,
+                    buffer_memory=0,
+                    cuda_memory_allocated=0,
+                    cuda_memory_cached=0,
+                    cuda_utilization=0,
+                    peak_memory=0
+                )
+
+                if self.level in (ProfilingLevel.MEMORY, ProfilingLevel.FULL):
+                    # Memory analysis
+                    self._analyze_memory(name, module, output, profile)
+
+                if self.level in (ProfilingLevel.COMPUTE, ProfilingLevel.FULL):
+                    # Computation analysis
+                    self._analyze_computation(name, module, profile, event_start, event_end)
+
+                # Store activation maps for visualization
+                if isinstance(output, torch.Tensor):
+                    self.activation_maps[name] = output.detach().cpu().numpy()
+
+                # Update profile
+                self.layer_profiles[name] = profile
+
+                # Check for bottlenecks
+                self._check_bottlenecks(name, profile)
+
+            except Exception as e:
+                self.logger.error(f"Error in forward hook for {name}: {str(e)}")
+        return hook
+
+    def _backward_hook(self, name: str):
+        """Backward pass hook for gradient analysis"""
+        def hook(module: nn.Module, grad_input: Tuple[torch.Tensor], grad_output: Tuple[torch.Tensor]):
+            try:
+                # Record gradient timing
+                event_start = self.cuda_events[f"{name}_backward_start"]
+                event_end = self.cuda_events[f"{name}_backward_end"]
+                event_start.record()
+
+                if self.level in (ProfilingLevel.COMPUTE, ProfilingLevel.FULL):
+                    # Gradient analysis
+                    if grad_output[0] is not None:
+                        grad_norm = grad_output[0].norm().item()
+                        self.gradient_history[name].append(grad_norm)
+
+                        if name in self.layer_profiles:
+                            self.layer_profiles[name].gradient_norm = grad_norm
+
+                event_end.record()
+
+            except Exception as e:
+                self.logger.error(f"Error in backward hook for {name}: {str(e)}")
+        return hook
+
+    def _analyze_memory(self, name: str, module: nn.Module, output: torch.Tensor, profile: LayerProfile) -> None:
+        """Detailed memory analysis for a layer"""
         try:
-            self.data[layer_name] = self.data.get(layer_name, {})
-            self.data[layer_name]['time'] = self.time_tracker.get_duration(layer_name)
-            self.data[layer_name]['parameters'] = sum(p.numel() for p in module.parameters())
+            # CPU memory
+            profile.cpu_memory = psutil.Process().memory_info().rss / 1024 / 1024  # MB
 
-            if config.enable_memory:
-                self.data[layer_name]['cpu_memory'] = await self.cpu_tracker.get_peak_memory()
-                if self.gpu_tracker:
-                    self.data[layer_name]['gpu_memory'] = await self.gpu_tracker.get_peak_memory()
-
-            if isinstance(output, torch.Tensor):
-                self.data[layer_name]['output_shape'] = list(output.shape)
-            elif isinstance(output, (list, tuple)) and all(isinstance(o, torch.Tensor) for o in output):
-                self.data[layer_name]['output_shape'] = [list(o.shape) for o in output]
-        except Exception as e:
-            self.logger.error(f"Error in forward hook for layer {layer_name}: {str(e)}")
-
-    async def _pre_forward_hook(self, module: torch.nn.Module, input: Any) -> None:
-        layer_name = f"{module.__class__.__name__}_{id(module)}"
-        self.time_tracker.start(layer_name)
-
-    async def profile_inference(self, input_data: torch.Tensor) -> Dict[str, Any]:
-        """Profile the inference process for a single input."""
-        await self.start_profiling()
-
-        try:
-            with torch.no_grad():
-                start_time = torch.cuda.Event(enable_timing=True)
-                end_time = torch.cuda.Event(enable_timing=True)
-
-                start_time.record()
-                output = self.model(input_data.to(self.device))
-                end_time.record()
-
-                torch.cuda.synchronize()
-                inference_time = start_time.elapsed_time(end_time) / 1000  # Convert to seconds
-
-            profiling_data = self.data.copy()
-            profiling_data['inference_time'] = inference_time
-
-            return profiling_data
-        finally:
-            await self.stop_profiling()
-
-    async def profile_training_step(self, input_data: torch.Tensor, target: torch.Tensor) -> Dict[str, Any]:
-        """Profile a single training step."""
-        await self.start_profiling()
-
-        try:
-            optimizer = config.get_optimizer(self.model.parameters())
-            loss_function = config.get_loss_function()
-
-            if optimizer is None or loss_function is None:
-                raise ValueError("Optimizer or loss function not properly configured")
-
-            start_time = torch.cuda.Event(enable_timing=True)
-            end_time = torch.cuda.Event(enable_timing=True)
-
-            start_time.record()
-            optimizer.zero_grad()
-            output = self.model(input_data.to(self.device))
-            loss = loss_function(output, target.to(self.device))
-            loss.backward()
-            optimizer.step()
-            end_time.record()
-
-            torch.cuda.synchronize()
-            step_time = start_time.elapsed_time(end_time) / 1000  # Convert to seconds
-
-            profiling_data = self.data.copy()
-            profiling_data['step_time'] = step_time
-            profiling_data['loss'] = loss.item()
-
-            return profiling_data
-        finally:
-            await self.stop_profiling()
-
-    async def profile_full_training(self, train_loader: torch.utils.data.DataLoader, num_epochs: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Profile the full training process."""
-        epochs_to_run = num_epochs or config.max_epochs
-        epoch_data = []
-
-        for epoch in range(epochs_to_run):
-            epoch_start_time = torch.cuda.Event(enable_timing=True)
-            epoch_end_time = torch.cuda.Event(enable_timing=True)
-
-            epoch_start_time.record()
-            epoch_loss = 0.0
-            batch_data = []
-
-            for batch_idx, (data, target) in enumerate(train_loader):
-                batch_profile = await self.profile_training_step(data, target)
-                epoch_loss += batch_profile['loss']
-                batch_data.append(batch_profile)
-
-            epoch_end_time.record()
-            torch.cuda.synchronize()
-            epoch_time = epoch_start_time.elapsed_time(epoch_end_time) / 1000  # Convert to seconds
-
-            epoch_data.append({
-                'epoch': epoch,
-                'epoch_time': epoch_time,
-                'epoch_loss': epoch_loss / len(train_loader),
-                'batch_data': batch_data
-            })
-
-        return epoch_data
-
-    async def get_model_summary(self) -> Dict[str, Any]:
-        """Get a summary of the model architecture."""
-        summary = {}
-        total_params = sum(p.numel() for p in self.model.parameters())
-        trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-
-        summary['total_params'] = total_params
-        summary['trainable_params'] = trainable_params
-        summary['non_trainable_params'] = total_params - trainable_params
-        summary['model_size_mb'] = total_params * 4 / (1024 * 1024)  # Assuming float32
-
-        return summary
-
-    async def get_layer_info(self, layer_name: str) -> Dict[str, Any]:
-        """Get detailed information about a specific layer."""
-        for name, module in self.model.named_modules():
-            if name == layer_name:
-                return {
-                    'type': type(module).__name__,
-                    'parameters': sum(p.numel() for p in module.parameters()),
-                    'trainable_parameters': sum(p.numel() for p in module.parameters() if p.requires_grad),
-                    'input_shape': getattr(module, 'in_features', None) or getattr(module, 'in_channels', None),
-                    'output_shape': getattr(module, 'out_features', None) or getattr(module, 'out_channels', None),
-                    'activation': getattr(module, 'activation', None),
-                    'dropout_rate': getattr(module, 'p', None) if isinstance(module, torch.nn.Dropout) else None,
-                }
-        return {}
-
-    async def profile_memory_usage(self) -> Dict[str, float]:
-        """Profile the memory usage of the model."""
-        torch.cuda.empty_cache()
-
-        def get_memory_usage():
+            # GPU memory if available
             if torch.cuda.is_available():
-                return torch.cuda.memory_allocated() / 1024**2  # Convert to MB
-            else:
-                import psutil
-                return psutil.Process().memory_info().rss / 1024**2  # Convert to MB
+                profile.gpu_memory = torch.cuda.memory_allocated() / 1024 / 1024  # MB
+                profile.cuda_memory_allocated = torch.cuda.memory_allocated() / 1024 / 1024
+                profile.cuda_memory_cached = torch.cuda.memory_reserved() / 1024 / 1024
 
-        initial_mem = get_memory_usage()
+                # Peak memory tracking
+                profile.peak_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
 
-        # Profile memory usage during forward pass
-        dummy_input = torch.randn(1, *self.model.input_size).to(self.device)
-        self.model(dummy_input)
-        forward_mem = get_memory_usage()
+            # Activation memory
+            if isinstance(output, torch.Tensor):
+                profile.activation_memory = output.element_size() * output.nelement() / 1024 / 1024
 
-        # Profile memory usage during backward pass
-        loss = self.model(dummy_input).sum()
-        loss.backward()
-        backward_mem = get_memory_usage()
+            # Buffer memory
+            profile.buffer_memory = sum(b.element_size() * b.nelement() for b in module.buffers()) / 1024 / 1024
 
+        except Exception as e:
+            self.logger.error(f"Error in memory analysis for {name}: {str(e)}")
+
+    def _analyze_computation(self, name: str, module: nn.Module, profile: LayerProfile,
+                             event_start: torch.cuda.Event, event_end: torch.cuda.Event) -> None:
+        """Detailed computation analysis for a layer"""
+        try:
+            # CUDA timing
+            torch.cuda.synchronize()
+            profile.compute_time = event_start.elapsed_time(event_end) / 1000  # Convert to seconds
+
+            # CUDA utilization
+            if torch.cuda.is_available():
+                profile.cuda_utilization = torch.cuda.utilization()
+
+        except Exception as e:
+            self.logger.error(f"Error in computation analysis for {name}: {str(e)}")
+
+    def _calculate_flops(self, module: nn.Module, input_tensor: torch.Tensor,
+                         output_tensor: torch.Tensor) -> int:
+        """Calculate FLOPs for different layer types"""
+        try:
+            if isinstance(module, nn.Conv2d):
+                return self._conv2d_flops(module, input_tensor)
+            elif isinstance(module, nn.Linear):
+                return self._linear_flops(module)
+            elif isinstance(module, nn.LSTM):
+                return self._lstm_flops(module)
+            return 0
+        except Exception as e:
+            self.logger.error(f"Error calculating FLOPs: {str(e)}")
+            return 0
+
+    def _conv2d_flops(self, module: nn.Conv2d, input_tensor: torch.Tensor) -> int:
+        """Calculate FLOPs for Conv2d layer"""
+        batch_size = input_tensor.shape[0]
+        output_height = input_tensor.shape[2] // module.stride[0]
+        output_width = input_tensor.shape[3] // module.stride[1]
+
+        kernel_ops = module.kernel_size[0] * module.kernel_size[1] * module.in_channels
+        flops_per_instance = kernel_ops * module.out_channels
+        total_flops = flops_per_instance * output_height * output_width * batch_size
+
+        return total_flops
+
+    def _check_bottlenecks(self, name: str, profile: LayerProfile) -> None:
+        """Identify performance bottlenecks"""
+        try:
+            # Memory bottleneck
+            if profile.gpu_memory > 1000:  # More than 1GB
+                self.bottlenecks.add(f"{name}_memory")
+
+            # Compute bottleneck
+            if profile.compute_time > 0.1:  # More than 100ms
+                self.bottlenecks.add(f"{name}_compute")
+
+            # Gradient bottleneck
+            if profile.gradient_norm > 100:
+                self.bottlenecks.add(f"{name}_gradient")
+
+        except Exception as e:
+            self.logger.error(f"Error checking bottlenecks for {name}: {str(e)}")
+
+    def start_monitoring(self) -> None:
+        """Start continuous resource monitoring"""
+        self._stop_monitoring.clear()
+        self._monitoring_thread = threading.Thread(target=self._monitor_resources)
+        self._monitoring_thread.daemon = True
+        self._monitoring_thread.start()
+
+    def stop_monitoring(self) -> None:
+        """Stop resource monitoring"""
+        self._stop_monitoring.set()
+        if self._monitoring_thread:
+            self._monitoring_thread.join()
+
+    def _monitor_resources(self) -> None:
+        """Continuous resource monitoring thread"""
+        while not self._stop_monitoring.is_set():
+            try:
+                gpu_info = {
+                    'memory_allocated': torch.cuda.memory_allocated() / 1024 / 1024,
+                    'memory_cached': torch.cuda.memory_reserved() / 1024 / 1024,
+                    'utilization': torch.cuda.utilization()
+                } if torch.cuda.is_available() else {}
+
+                cpu_info = {
+                    'cpu_percent': psutil.cpu_percent(),
+                    'memory_percent': psutil.virtual_memory().percent,
+                    'swap_percent': psutil.swap_memory().percent
+                }
+
+                self._monitoring_queue.put({
+                    'timestamp': time.time(),
+                    'gpu': gpu_info,
+                    'cpu': cpu_info
+                })
+
+                time.sleep(0.1)  # 100ms interval
+
+            except Exception as e:
+                self.logger.error(f"Error in resource monitoring: {str(e)}")
+
+    def get_profiling_results(self) -> Dict[str, Any]:
+        """Get comprehensive profiling results"""
         return {
-            'initial_memory': initial_mem,
-            'forward_pass_memory': forward_mem - initial_mem,
-            'backward_pass_memory': backward_mem - forward_mem,
-            'total_memory': backward_mem - initial_mem
+            'layer_profiles': {name: vars(profile) for name, profile in self.layer_profiles.items()},
+            'bottlenecks': list(self.bottlenecks),
+            'training_history': self.training_history,
+            'gradient_history': dict(self.gradient_history),
+            'memory_traces': dict(self.memory_traces),
+            'monitoring_data': self._get_monitoring_data()
         }
 
-    def get_flops(self) -> int:
-        """Calculate the total number of FLOPs for the model."""
-        from torch.autograd import Variable
 
-        flops = 0
-        for module in self.model.modules():
-            if isinstance(module, torch.nn.Conv2d):
-                flops += (2 * module.in_channels * module.out_channels * module.kernel_size[0] * module.kernel_size[1] - 1) * (module.input_size[2] * module.input_size[3] / (module.stride[0] * module.stride[1]))
-            elif isinstance(module, torch.nn.Linear):
-                flops += 2 * module.in_features * module.out_features - 1
+    def _get_monitoring_data(self) -> List[Dict[str, Any]]:
+        """Get collected monitoring data"""
+        data = []
+        while not self._monitoring_queue.empty():
+            data.append(self._monitoring_queue.get())
+        return data
 
-        return int(flops)
 
-    async def visualize_model(self, output_path: str) -> None:
-        """Generate a visual representation of the model architecture."""
-        from torchviz import make_dot
+    def save_results(self, filename: str) -> None:
+        """Save profiling results to file"""
+        try:
+            results = self.get_profiling_results()
 
-        dummy_input = torch.randn(1, *self.model.input_size).to(self.device)
-        y = self.model(dummy_input)
+            # Convert numpy arrays to lists for JSON serialization
+            for name, activation in self.activation_maps.items():
+                if isinstance(activation, np.ndarray):
+                    results[f'activation_{name}'] = activation.tolist()
 
-        dot = make_dot(y, params=dict(self.model.named_parameters()))
-        dot.render(output_path, format='png')
-        self.logger.info(f"Model visualization saved to {output_path}.png")
+            # Save to file
+            with open(filename, 'w') as f:
+                json.dump(results, f, indent=4)
 
-    async def export_onnx(self, output_path: str) -> None:
-        """Export the model to ONNX format."""
-        dummy_input = torch.randn(1, *self.model.input_size).to(self.device)
-        torch.onnx.export(self.model, dummy_input, output_path, verbose=True)
-        self.logger.info(f"Model exported to ONNX format at {output_path}")
+            self.logger.info(f"Profiling results saved to {filename}")
 
-    async def export_model(self, path: str, format: str) -> None:
-        """Export the model to a specified format."""
-        if format.lower() == 'onnx':
-            await self.export_onnx(path)
-        elif format.lower() == 'torchscript':
-            script_module = torch.jit.script(self.model)
-            torch.jit.save(script_module, path)
-            self.logger.info(f"Model exported to TorchScript format at {path}")
-        else:
-            raise ValueError(f"Unsupported export format: {format}")
+        except Exception as e:
+            self.logger.error(f"Error saving profiling results: {str(e)}")
+            raise
 
-    async def get_current_time(self) -> float:
-        """Get the current time in a high-precision format."""
-        return time.perf_counter()
+    async def profile_training_step(self,
+                                    input_data: torch.Tensor,
+                                    target: torch.Tensor,
+                                    optimizer: torch.optim.Optimizer,
+                                    criterion: nn.Module) -> Dict[str, float]:
+        """Profile a single training step with detailed metrics"""
+        try:
+            # Start timing
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
 
-    async def get_optimizer_info(self) -> Dict[str, Any]:
-        """Get information about the current optimizer."""
-        optimizer = getattr(self.model, 'optimizer', None)
-        if optimizer:
-            return {
-                'name': optimizer.__class__.__name__,
-                'learning_rate': optimizer.param_groups[0]['lr'],
-                'parameters': {k: v for k, v in optimizer.defaults.items() if k != 'params'}
+            # Clear gradients
+            optimizer.zero_grad()
+
+            # Forward pass timing
+            forward_start = torch.cuda.Event(enable_timing=True)
+            forward_end = torch.cuda.Event(enable_timing=True)
+
+            forward_start.record()
+            output = self.model(input_data.to(self.device))
+            forward_end.record()
+
+            # Loss computation
+            loss = criterion(output, target.to(self.device))
+
+            # Backward pass timing
+            backward_start = torch.cuda.Event(enable_timing=True)
+            backward_end = torch.cuda.Event(enable_timing=True)
+
+            backward_start.record()
+            loss.backward()
+            backward_end.record()
+
+            # Optimizer step timing
+            optim_start = torch.cuda.Event(enable_timing=True)
+            optim_end = torch.cuda.Event(enable_timing=True)
+
+            optim_start.record()
+            optimizer.step()
+            optim_end.record()
+
+            # Synchronize and record timings
+            torch.cuda.synchronize()
+
+            metrics = {
+                'total_time': start_event.elapsed_time(end_event) / 1000,
+                'forward_time': forward_start.elapsed_time(forward_end) / 1000,
+                'backward_time': backward_start.elapsed_time(backward_end) / 1000,
+                'optimizer_time': optim_start.elapsed_time(optim_end) / 1000,
+                'loss': loss.item(),
+                'gpu_memory': torch.cuda.memory_allocated() / 1024 / 1024 if torch.cuda.is_available() else 0,
+                'cpu_memory': psutil.Process().memory_info().rss / 1024 / 1024
             }
-        return {'error': 'No optimizer found'}
 
-    async def get_loss_function_info(self) -> Dict[str, Any]:
-        """Get information about the current loss function."""
-        loss_fn = getattr(self.model, 'loss_fn', None)
-        if loss_fn:
-            return {
-                'name': loss_fn.__class__.__name__,
-                'parameters': {k: v for k, v in loss_fn.__dict__.items() if not k.startswith('_')}
+            # Record gradient norms
+            grad_norms = {
+                name: param.grad.norm().item()
+                for name, param in self.model.named_parameters()
+                if param.grad is not None
             }
-        return {'error': 'No loss function found'}
+            metrics['gradient_norms'] = grad_norms
 
-    def __del__(self):
-        """Cleanup method to ensure all profiling is stopped."""
-        asyncio.run(self.stop_profiling())
+            # Add to training history
+            self.training_history.append(metrics)
+
+            return metrics
+
+        except Exception as e:
+            self.logger.error(f"Error in training step profiling: {str(e)}")
+            raise
+
+    def analyze_model_architecture(self) -> Dict[str, Any]:
+        """Analyze model architecture for optimization opportunities"""
+        try:
+            analysis = {
+                'total_parameters': sum(p.numel() for p in self.model.parameters()),
+                'trainable_parameters': sum(p.numel() for p in self.model.parameters() if p.requires_grad),
+                'layer_distribution': {},
+                'memory_distribution': {},
+                'compute_distribution': {},
+                'optimization_suggestions': []
+            }
+
+            # Analyze layer distribution
+            layer_types = {}
+            for name, module in self.model.named_modules():
+                layer_type = module.__class__.__name__
+                layer_types[layer_type] = layer_types.get(layer_type, 0) + 1
+            analysis['layer_distribution'] = layer_types
+
+            # Memory and compute analysis
+            total_memory = sum(p.memory_usage for p in self.layer_profiles.values())
+            total_compute = sum(p.compute_time for p in self.layer_profiles.values())
+
+            for name, profile in self.layer_profiles.items():
+                analysis['memory_distribution'][name] = profile.memory_usage / total_memory
+                analysis['compute_distribution'][name] = profile.compute_time / total_compute
+
+            # Generate optimization suggestions
+            self._generate_optimization_suggestions(analysis)
+
+            return analysis
+
+        except Exception as e:
+            self.logger.error(f"Error in model architecture analysis: {str(e)}")
+            raise
+
+    def _generate_optimization_suggestions(self, analysis: Dict[str, Any]) -> None:
+        """Generate optimization suggestions based on profiling data"""
+        suggestions = []
+
+        # Memory optimization suggestions
+        for name, memory_percent in analysis['memory_distribution'].items():
+            if memory_percent > 0.2:  # Layer uses more than 20% of total memory
+                suggestions.append({
+                    'type': 'memory',
+                    'layer': name,
+                    'suggestion': 'Consider reducing layer size or using gradient checkpointing',
+                    'impact': 'high'
+                })
+
+        # Compute optimization suggestions
+        for name, compute_percent in analysis['compute_distribution'].items():
+            if compute_percent > 0.3:  # Layer uses more than 30% of compute time
+                suggestions.append({
+                    'type': 'compute',
+                    'layer': name,
+                    'suggestion': 'Consider using a more efficient layer type or reducing complexity',
+                    'impact': 'high'
+                })
+
+        # Model-wide suggestions
+        if analysis['total_parameters'] > 1e8:  # More than 100M parameters
+            suggestions.append({
+                'type': 'model',
+                'suggestion': 'Consider model pruning or quantization',
+                'impact': 'medium'
+            })
+
+        analysis['optimization_suggestions'] = suggestions
+
+    def visualize_profiling_results(self, output_dir: str) -> None:
+        """Generate comprehensive visualization of profiling results"""
+        try:
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+
+            output_path = Path(output_dir)
+            output_path.mkdir(parents=True, exist_ok=True)
+
+            # Memory usage over time
+            plt.figure(figsize=(12, 6))
+            plt.plot(self.training_history)
+            plt.title('Memory Usage Over Time')
+            plt.xlabel('Training Step')
+            plt.ylabel('Memory (MB)')
+            plt.savefig(output_path / 'memory_usage.png')
+            plt.close()
+
+            # Layer compute times
+            compute_times = {name: profile.compute_time for name, profile in self.layer_profiles.items()}
+            plt.figure(figsize=(15, 8))
+            sns.barplot(x=list(compute_times.values()), y=list(compute_times.keys()))
+            plt.title('Layer Compute Times')
+            plt.xlabel('Time (s)')
+            plt.savefig(output_path / 'compute_times.png')
+            plt.close()
+
+            # Generate HTML report
+            self._generate_html_report(output_path)
+
+        except Exception as e:
+            self.logger.error(f"Error in visualization: {str(e)}")
+            raise
+
+    def _generate_html_report(self, output_path: Path) -> None:
+        """Generate detailed HTML report with all profiling information"""
+        try:
+            analysis = self.analyze_model_architecture()
+            results = self.get_profiling_results()
+
+            html_content = f"""
+            <html>
+                <head>
+                    <title>PyTorch Model Profiling Report</title>
+                    <style>
+                        body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                        .section {{ margin: 20px 0; padding: 20px; border: 1px solid #ddd; }}
+                        .warning {{ color: red; }}
+                        .metric {{ font-weight: bold; }}
+                    </style>
+                </head>
+                <body>
+                    <h1>PyTorch Model Profiling Report</h1>
+                    
+                    <div class="section">
+                        <h2>Model Architecture</h2>
+                        <p>Total Parameters: {analysis['total_parameters']:,}</p>
+                        <p>Trainable Parameters: {analysis['trainable_parameters']:,}</p>
+                    </div>
+
+                    <div class="section">
+                        <h2>Performance Metrics</h2>
+                        <p>Peak GPU Memory: {max(p.gpu_memory for p in self.layer_profiles.values()):.2f} MB</p>
+                        <p>Total Compute Time: {sum(p.compute_time for p in self.layer_profiles.values()):.2f} s</p>
+                    </div>
+
+                    <div class="section">
+                        <h2>Optimization Suggestions</h2>
+                        {''.join(f'<p class="warning">{s["suggestion"]}</p>' for s in analysis['optimization_suggestions'])}
+                    </div>
+
+                    <div class="section">
+                        <h2>Layer Profiles</h2>
+                        {''.join(f'<div class="metric">{name}: {profile.compute_time:.4f}s, {profile.gpu_memory:.2f}MB</div>'
+                                 for name, profile in self.layer_profiles.items())}
+                    </div>
+                </body>
+            </html>
+            """
+
+            with open(output_path / 'profiling_report.html', 'w') as f:
+                f.write(html_content)
+
+        except Exception as e:
+            self.logger.error(f"Error generating HTML report: {str(e)}")
+            raise
+
+    def __enter__(self):
+        """Context manager entry"""
+        self.start_monitoring()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit"""
+        self.stop_monitoring()

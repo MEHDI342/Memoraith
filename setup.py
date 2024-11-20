@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="memoraith",
-    version="0.3.5",
+    version="0.4.0",  # Updated version number
     author="Mehdi El Jouhfi",
     author_email="midojouhfi@gmail.com",
     description="Advanced lightweight model profiler for deep learning frameworks",
@@ -38,6 +38,8 @@ setup(
         'aiofiles>=0.6.0',
         'asyncio>=3.4.3',
         'networkx>=2.5',
+        'python-dotenv>=0.19.0',
+        'pyyaml>=5.4.0'
     ],
     extras_require={
         'full': [

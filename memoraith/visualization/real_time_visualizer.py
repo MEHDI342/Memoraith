@@ -1,9 +1,12 @@
-import asyncio
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-from typing import Dict, Any
+import logging
 import numpy as np
+import matplotlib.pyplot as plt
+import aiofiles
+from typing import Dict, Any, List
+import asyncio
+from ..config import config
 
+# 2. Fix real_time_visualizer.py
 class RealTimeVisualizer:
     """Real-time visualization of profiling data."""
 
@@ -11,6 +14,7 @@ class RealTimeVisualizer:
         self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(10, 10))
         self.memory_data = {}
         self.time_data = {}
+        self.animation = None
         plt.ion()  # Turn on interactive mode
         self.fig.show()
 
@@ -47,39 +51,43 @@ class RealTimeVisualizer:
         """Close the visualization window."""
         plt.close(self.fig)
 
-    async def add_data(self, memory, time):
-        self.memory_data.append(memory)
-        self.time_data.append(time)
+    async def add_data(self, memory: float, time: float) -> None:
+        """Add new data points to the visualization."""
+        self.memory_data = memory
+        self.time_data = time
+        await self._draw()
 
-    async def stop(self):
+    async def stop(self) -> None:
+        """Stop the visualization."""
         if self.animation:
             self.animation.event_source.stop()
         plt.close(self.fig)
 
-# Usage
-async def main():
-    visualizer = RealTimeVisualizer()
-    await visualizer.start()
+# 3. Fix TensorFlowAdapter _wrapped_call method
+async def _wrapped_call(self, *args, **kwargs) -> Any:
+    """Wrapped call method for profiling each layer."""
+    output = None
+    for layer in self.model.layers:
+        layer_name = f"{layer.__class__.__name__}_{id(layer)}"
+        self.time_tracker.start(layer_name)
+        output = layer(*args, **kwargs)
+        self.time_tracker.stop(layer_name)
 
-    for _ in range(100):
-        await visualizer.add_data(np.random.rand() * 100, np.random.rand())
-        await asyncio.sleep(0.1)
+        try:
+            self.data[layer_name] = self.data.get(layer_name, {})
+            self.data[layer_name]['time'] = self.time_tracker.get_duration(layer_name)
+            self.data[layer_name]['parameters'] = layer.count_params()
 
-    await visualizer.stop()
+            if config.enable_memory:
+                self.data[layer_name]['cpu_memory'] = await self.cpu_tracker.get_peak_memory()
+                if self.gpu_tracker:
+                    self.data[layer_name]['gpu_memory'] = await self.gpu_tracker.get_peak_memory()
 
-if __name__ == "__main__":
-    asyncio.run(main())
+            if hasattr(output, 'shape'):
+                self.data[layer_name]['output_shape'] = output.shape.as_list()
+        except Exception as e:
+            self.logger.error(f"Error in _wrapped_call for layer {layer_name}: {str(e)}")
 
-    # Usage
-    async def main():
-        visualizer = RealTimeVisualizer()
-        await visualizer.start()
+        args = (output,)
 
-        for _ in range(100):
-            await visualizer.add_data(np.random.rand() * 100, np.random.rand())
-            await asyncio.sleep(0.1)
-
-        await visualizer.stop()
-
-    if __name__ == "__main__":
-        asyncio.run(main())
+    return output

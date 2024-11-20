@@ -78,7 +78,7 @@ def save_content_to_txt(directory, output_file):
 
 # Usage
 project_directory = r"C:\Users\PC\Desktop\Leo-Major\Memoraith"
-output_file = r"C:\Users\PC\Desktop\Leo-Major\projetoo_content.txt"
+output_file = r"C:\Users\PC\Desktop\Leo-Major\Memoraith\projetoo_content.txt"
 
 try:
     save_content_to_txt(project_directory, output_file)

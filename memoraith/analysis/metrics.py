@@ -1,82 +1,69 @@
-from typing import Dict, Any
+
 import logging
-import asyncio
+from typing import Dict, Any
 
 class MetricsCalculator:
-    """Calculates various performance metrics from the collected data."""
-
     def __init__(self, data: Dict[str, Any]):
         self.data = data
         self.logger = logging.getLogger(__name__)
 
     async def calculate(self) -> Dict[str, Any]:
-        """
-        Compute metrics such as total memory and time per layer.
-
-        Returns:
-            Dict[str, Any]: Calculated metrics for each layer and global metrics
-        """
-        metrics = {}
+        """Calculate key performance metrics"""
         try:
-            for layer_name, stats in self.data.items():
-                metrics[layer_name] = await self._calculate_layer_metrics(stats)
+            # Process raw data
+            network_metrics = self._calculate_network_metrics()
+            memory_metrics = self._calculate_memory_metrics()
+            time_metrics = self._calculate_time_metrics()
 
-            metrics['global'] = await self._calculate_global_metrics(metrics)
+            return {
+                **network_metrics,
+                **memory_metrics,
+                **time_metrics,
+                'global_metrics': self._calculate_global_metrics()
+            }
         except Exception as e:
-            self.logger.error(f"Error calculating metrics: {str(e)}")
+            self.logger.error(f"Metrics calculation failed: {str(e)}")
+            return {}
 
-        return metrics
-
-    async def _calculate_layer_metrics(self, stats: Dict[str, Any]) -> Dict[str, Any]:
-        """Calculate metrics for a single layer."""
+    def _calculate_network_metrics(self) -> Dict[str, float]:
+        """Calculate network-related metrics"""
+        network_data = self.data.get('network', {})
         return {
-            'total_cpu_memory': stats.get('cpu_memory', 0),
-            'total_gpu_memory': stats.get('gpu_memory', 0),
-            'total_time': stats.get('time', 0),
-            'parameters': stats.get('parameters', 0),
-            'output_shape': stats.get('output_shape', []),
-            'flops': await self._estimate_flops(stats)
+            'peak_bandwidth': max((m.get('bandwidth_mbps', 0) for m in network_data), default=0),
+            'average_bandwidth': sum((m.get('bandwidth_mbps', 0) for m in network_data)) / len(network_data) if network_data else 0,
+            'total_bytes_transferred': sum((m.get('bytes_sent', 0) + m.get('bytes_recv', 0) for m in network_data))
         }
 
-    async def _calculate_global_metrics(self, layer_metrics: Dict[str, Any]) -> Dict[str, Any]:
-        """Calculate global metrics across all layers."""
-        total_time = sum(layer['total_time'] for layer in layer_metrics.values() if isinstance(layer, dict))
-        total_parameters = sum(layer['parameters'] for layer in layer_metrics.values() if isinstance(layer, dict))
-        total_flops = sum(layer['flops'] for layer in layer_metrics.values() if isinstance(layer, dict))
-
+    def _calculate_memory_metrics(self) -> Dict[str, float]:
+        """Calculate memory-related metrics"""
+        memory_data = self.data.get('memory', {})
         return {
-            'total_time': total_time,
-            'total_parameters': total_parameters,
-            'peak_cpu_memory': max((layer['total_cpu_memory'] for layer in layer_metrics.values() if isinstance(layer, dict)), default=0),
-            'peak_gpu_memory': max((layer['total_gpu_memory'] for layer in layer_metrics.values() if isinstance(layer, dict)), default=0),
-            'total_flops': total_flops
+            'peak_memory': max((m.get('rss', 0) for m in memory_data), default=0),
+            'average_memory': sum((m.get('rss', 0) for m in memory_data)) / len(memory_data) if memory_data else 0,
+            'peak_memory_percent': max((m.get('memory_percent', 0) for m in memory_data), default=0)
         }
 
-    async def _estimate_flops(self, stats: Dict[str, Any]) -> int:
-        """Estimate FLOPs for a layer based on its type and parameters."""
-        layer_type = stats.get('type', '')
-        input_shape = stats.get('input_shape', [])
-        output_shape = stats.get('output_shape', [])
-        parameters = stats.get('parameters', 0)
+    def _calculate_time_metrics(self) -> Dict[str, float]:
+        """Calculate time-related metrics"""
+        time_data = self.data.get('time', {})
+        return {
+            'total_time': sum((m.get('duration', 0) for m in time_data)),
+            'average_response_time': sum((m.get('duration', 0) for m in time_data)) / len(time_data) if time_data else 0
+        }
 
-        # This is a simplified estimation and should be expanded for different layer types
-        if 'conv' in layer_type.lower():
-            return parameters * output_shape[1] * output_shape[2]  # Assuming NCHW format
-        elif 'linear' in layer_type.lower():
-            return 2 * parameters  # multiply-add operations
-        else:
-            return parameters  # fallback estimation
+    def _calculate_global_metrics(self) -> Dict[str, Any]:
+        """Calculate global performance metrics"""
+        return {
+            'start_time': min((m.get('timestamp', 0) for m in self.data.get('time', [])), default=0),
+            'end_time': max((m.get('timestamp', 0) for m in self.data.get('time', [])), default=0),
+            'total_samples': len(self.data.get('time', [])),
+            'success_rate': self._calculate_success_rate()
+        }
 
-    async def get_layer_efficiency(self, layer_name: str) -> float:
-        """Calculate the efficiency of a layer (FLOPs per second)."""
-        layer_metrics = self.data.get(layer_name, {})
-        flops = await self._estimate_flops(layer_metrics)
-        time = layer_metrics.get('time', 1e-6)  # Avoid division by zero
-        return flops / time if time > 0 else 0
-
-    async def get_model_efficiency(self) -> float:
-        """Calculate the overall model efficiency (FLOPs per second)."""
-        metrics = await self.calculate()
-        total_flops = metrics['global']['total_flops']
-        total_time = metrics['global']['total_time']
-        return total_flops / total_time if total_time > 0 else 0
+    def _calculate_success_rate(self) -> float:
+        """Calculate the overall success rate of operations"""
+        total = len(self.data.get('time', []))
+        if not total:
+            return 0.0
+        failures = sum(1 for m in self.data.get('time', []) if m.get('error', False))
+        return (total - failures) / total * 100
