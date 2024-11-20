@@ -1,42 +1,67 @@
+<div align="center">
+  <img src="assets/logo.png" alt="Memoraith Logo" width="600"/>
+
 # Memoraith
 
-Memoraith is a cutting-edge, lightweight model profiler for deep learning frameworks, developed by Mehdi El Jouhfi. It's designed to revolutionize the optimization of neural network models by providing unparalleled insights into their performance characteristics.
+[![PyPI version](https://badge.fury.io/py/memoraith.svg)](https://badge.fury.io/py/memoraith)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
+[![Documentation Status](https://readthedocs.org/projects/memoraith/badge/?version=latest)](https://memoraith.readthedocs.io/en/latest/?badge=latest)
 
-## Features
+**Advanced Lightweight Model Profiler for Deep Learning**
+</div>
 
-- Advanced support for PyTorch and TensorFlow models
-- High-precision profiling of memory usage (CPU and GPU)
-- Microsecond-accurate computation time measurement for each layer
-- Sophisticated bottleneck and anomaly detection algorithms
-- Generation of comprehensive, interactive reports with advanced visualizations
-- Real-time visualization capabilities with minimal overhead
-- Flexible programmatic and command-line interfaces
+## Overview
 
-## Installation
+Memoraith is a cutting-edge, lightweight model profiler for deep learning frameworks, providing unparalleled insights into neural network performance. Developed with precision and efficiency in mind, it helps developers and researchers optimize their models through detailed performance analysis.
 
-Install Memoraith using pip:
+## ✨ Key Features
 
+- 🔍 **Advanced Profiling**
+    - High-precision memory tracking (CPU & GPU)
+    - Microsecond-accurate computation timing
+    - Layer-by-layer performance analysis
+
+- 🎯 **Intelligent Analysis**
+    - Sophisticated bottleneck detection
+    - Anomaly identification
+    - Optimization recommendations
+
+- 📊 **Rich Visualization**
+    - Interactive dashboards
+    - Real-time monitoring
+    - Comprehensive reports
+
+- 🛠 **Framework Support**
+    - PyTorch integration
+    - TensorFlow support
+    - Extensible architecture
+
+## 🚀 Installation
+
+Basic installation:
 ```bash
 pip install memoraith
 ```
 
-For GPU support and additional features:
-
+Full installation with GPU support and extra features:
 ```bash
 pip install memoraith[full]
 ```
 
-## Quick Start
+## 🎮 Quick Start
 
-Here's an example of Memoraith in action with a PyTorch model:
+Here's a simple example using PyTorch:
 
 ```python
 from memoraith import profile_model, set_output_path
 import torch
 import torch.nn as nn
 
+# Set output directory for profiling results
 set_output_path('profiling_results/')
 
+# Define your model
 class AdvancedNet(nn.Module):
     def __init__(self):
         super(AdvancedNet, self).__init__()
@@ -50,7 +75,8 @@ class AdvancedNet(nn.Module):
         x = x.view(x.size(0), -1)
         return self.fc(x)
 
-@profile_model(memory=True, computation=True, gpu=True, network=True)
+# Add profiling decorator
+@profile_model(memory=True, computation=True, gpu=True)
 def train_model(model):
     optimizer = torch.optim.Adam(model.parameters())
     for _ in range(100):
@@ -65,37 +91,52 @@ if __name__ == "__main__":
     train_model(model)
 ```
 
-This will generate a comprehensive profiling report in the 'profiling_results/' directory.
+## 📚 Documentation
 
-## Documentation
+Visit our [comprehensive documentation](https://memoraith.readthedocs.io) for:
+- Detailed API reference
+- Advanced usage examples
+- Best practices
+- Troubleshooting guides
 
-For detailed information on Memoraith's advanced features, please refer to our [comprehensive documentation](https://memoraith.readthedocs.io).
+## 🤝 Contributing
 
-## Contributing
+We welcome contributions! See our [Contributing Guide](CONTRIBUTING.md) for:
+- Code of conduct
+- Development setup
+- Submission guidelines
+- Testing procedures
 
-Contributions are welcome! Please read our [Contributing Guide](CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests.
+## 📝 License
 
-## License
+Memoraith is released under the MIT License. See [LICENSE](LICENSE) file for details.
 
-Memoraith is released under the MIT License. See the [LICENSE](LICENSE) file for more details.
+## 🆘 Support
 
-## Support
+Need help?
+- 📋 [GitHub Issues](https://github.com/mehdi342/Memoraith/issues)
+- 📚 [Documentation](https://memoraith.readthedocs.io)
+- 📧 [Email Support](mailto:midojouhfi@gmail.com)
 
-If you encounter any issues or have questions, please file an issue on the [GitHub issue tracker](https://github.com/mehdi342/Memoraith/issues).
+## 📖 Citation
 
-## Citing Memoraith
-
-If you use Memoraith in your research, please cite it as follows:
+If you use Memoraith in your research, please cite:
 
 ```bibtex
 @software{memoraith,
-  author = {El Jouhfi, Mehdi},
-  title = {Memoraith: Advanced Lightweight Model Profiler for Deep Learning},
-  year = {2024},
-  url = {https://github.com/mehdi342/Memoraith}
+    author = {El Jouhfi, Mehdi},
+    title = {Memoraith: Advanced Lightweight Model Profiler for Deep Learning},
+    year = {2024},
+    url = {https://github.com/mehdi342/Memoraith},
+    version = {0.5.0}
 }
 ```
 
-## Contact
+## 📬 Contact
 
-For inquiries, please contact Mehdi El Jouhfi at midojouhfi@gmail.com.
+For inquiries, reach out to [Mehdi El Jouhfi](mailto:midojouhfi@gmail.com)
+
+---
+<div align="center">
+  Made with ❤️ and sweat by Mehdi El Jouhfi
+</div>
