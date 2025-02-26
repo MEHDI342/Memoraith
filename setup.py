@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="memoraith",
-    version="0.4.0",  # Updated version number
+    version="0.5.0",  # Updated to match __init__.py
     author="Mehdi El Jouhfi",
     author_email="midojouhfi@gmail.com",
     description="Advanced lightweight model profiler for deep learning frameworks",
