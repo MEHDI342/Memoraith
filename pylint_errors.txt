@@ -70,6 +70,7 @@ memoraith\data_collection\network_memory_system.py:630:19 - Instance of 'MemoryM
 memoraith\data_collection\network_memory_system.py:632:24 - Instance of 'MemoryMetrics' has no '_calculate_total_metrics' member [no-member] (Error)
 memoraith\data_collection\network_memory_system.py:633:23 - Instance of 'MemoryMetrics' has no '_calculate_peak_metrics' member [no-member] (Error)
 memoraith\data_collection\network_memory_system.py:634:26 - Instance of 'MemoryMetrics' has no '_calculate_average_metrics' member [no-member] (Error)
+memoraith\data_collection\network_profiler.py:682:63 - Undefined variable 'threshold_threshold' [undefined-variable] (Error)
 memoraith\integration\common_utils.py:72:29 - Undefined variable 'tf' [undefined-variable] (Error)
 memoraith\integration\common_utils.py:109:21 - Undefined variable 'tf' [undefined-variable] (Error)
 memoraith\integration\pytorch_adapter.py:129:24 - Instance of 'PyTorchAdapter' has no '_record_cuda_memory' member [no-member] (Error)

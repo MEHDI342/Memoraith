@@ -1,211 +1,582 @@
+"""
+TensorFlow integration adapter for Memoraith profiler.
+Handles profiling of TensorFlow models with comprehensive metrics collection.
+"""
+
 import tensorflow as tf
 import time
-from typing import Dict, Any, List
 import logging
+import asyncio
+from typing import Dict, Any, List, Optional
+
+from ..exceptions import MemoraithError
 from .framework_adapter import FrameworkAdapter
 from ..data_collection import TimeTracker, CPUMemoryTracker, GPUMemoryTracker
 from ..config import config
 
+# Properly handle TensorFlow import structure changes between versions
+try:
+    # For TensorFlow 2.x
+    from tensorflow import keras
+except ImportError:
+    # Fallback for older versions
+    try:
+        import keras
+    except ImportError:
+        keras = None
+
 class TensorFlowAdapter(FrameworkAdapter):
     """Advanced adapter for integrating with TensorFlow models."""
 
-    def __init__(self, model: tf.keras.Model):
+    def __init__(self, model):
+        """
+        Initialize the TensorFlow adapter.
+
+        Args:
+            model: The TensorFlow model to profile
+        """
         super().__init__(model)
         self.time_tracker = TimeTracker()
         self.cpu_tracker = CPUMemoryTracker()
         self.gpu_tracker = GPUMemoryTracker() if tf.test.is_built_with_cuda() and config.enable_gpu else None
         self.original_call = None
         self.logger = logging.getLogger(__name__)
+        self._original_fit = None
+        self._original_predict = None
+        self._original_evaluate = None
+
+    def log_profiling_start(self) -> None:
+        """Log when profiling starts."""
+        self.logger.info("TensorFlow profiling started")
+
+    def log_profiling_stop(self) -> None:
+        """Log when profiling stops."""
+        self.logger.info("TensorFlow profiling stopped")
 
     async def start_profiling(self) -> None:
-        """Start profiling by wrapping the model's call method."""
-        self.original_call = self.model.call
-        self.model.call = self._wrapped_call
+        """Start profiling by wrapping model methods."""
+        try:
+            # Cache original methods
+            if hasattr(self.model, 'call'):
+                self.original_call = self.model.call
+                self.model.call = self._wrapped_call
 
-        await self.cpu_tracker.start()
-        if self.gpu_tracker:
-            await self.gpu_tracker.start()
-        await self.log_profiling_start()
+            # Wrap other important methods when available
+            if hasattr(self.model, 'fit'):
+                self._original_fit = self.model.fit
+                self.model.fit = self._wrapped_fit
+
+            if hasattr(self.model, 'predict'):
+                self._original_predict = self.model.predict
+                self.model.predict = self._wrapped_predict
+
+            if hasattr(self.model, 'evaluate'):
+                self._original_evaluate = self.model.evaluate
+                self.model.evaluate = self._wrapped_evaluate
+
+            # Start resource monitoring
+            await self.cpu_tracker.start()
+            if self.gpu_tracker:
+                await self.gpu_tracker.start()
+
+            # Log initial memory usage
+            initial_memory = await self._get_initial_memory()
+            self.data['initial_memory'] = initial_memory
+
+            self.log_profiling_start()
+            self.logger.debug(f"Initial memory usage: CPU={initial_memory.get('cpu_memory', 0):.2f}MB, GPU={initial_memory.get('gpu_memory', 0):.2f}MB")
+
+        except Exception as e:
+            self.logger.error(f"Error starting TensorFlow profiling: {str(e)}")
+            await self.cleanup()
+            raise MemoraithError(f"Failed to start TensorFlow profiling: {str(e)}")
 
     async def stop_profiling(self) -> None:
-        """Restore the original call method after profiling."""
-        if self.original_call:
-            self.model.call = self.original_call
-            self.original_call = None
-
-        await self.cpu_tracker.stop()
-        if self.gpu_tracker:
-            await self.gpu_tracker.stop()
-        await self.log_profiling_stop()
-
-    async def _wrapped_call(self, *args, **kwargs):
-        """Wrapped call method for profiling each layer."""
-        for layer in self.model.layers:
-            layer_name = f"{layer.__class__.__name__}_{id(layer)}"
-            self.time_tracker.start(layer_name)
-            output = layer(*args, **kwargs)
-            self.time_tracker.stop(layer_name)
-
-            try:
-                self.data[layer_name] = self.data.get(layer_name, {})
-                self.data[layer_name]['time'] = self.time_tracker.get_duration(layer_name)
-                self.data[layer_name]['parameters'] = layer.count_params()
-
-                if config.enable_memory:
-                    self.data[layer_name]['cpu_memory'] = await self.cpu_tracker.get_peak_memory()
-                    if self.gpu_tracker:
-                        self.data[layer_name]['gpu_memory'] = await self.gpu_tracker.get_peak_memory()
-
-                if hasattr(output, 'shape'):
-                    self.data[layer_name]['output_shape'] = output.shape.as_list()
-            except Exception as e:
-                self.logger.error(f"Error in _wrapped_call for layer {layer_name}: {str(e)}")
-
-            args = (output,)
-
-        return await self.original_call(*args, **kwargs)
-
-    async def profile_inference(self, input_data: tf.Tensor) -> Dict[str, Any]:
-        """Profile the inference process for a single input."""
-        await self.start_profiling()
+        """Stop profiling and restore original methods."""
         try:
-            start_time = time.perf_counter()
+            # Restore original methods
+            if self.original_call:
+                self.model.call = self.original_call
+                self.original_call = None
+
+            if self._original_fit:
+                self.model.fit = self._original_fit
+                self._original_fit = None
+
+            if self._original_predict:
+                self.model.predict = self._original_predict
+                self._original_predict = None
+
+            if self._original_evaluate:
+                self.model.evaluate = self._original_evaluate
+                self._original_evaluate = None
+
+            # Stop resource monitoring
+            await self.cpu_tracker.stop()
+            if self.gpu_tracker:
+                await self.gpu_tracker.stop()
+
+            # Get final memory usage
+            final_memory = await self._get_final_memory()
+            self.data['final_memory'] = final_memory
+
+            # Calculate memory delta
+            if 'initial_memory' in self.data:
+                self.data['memory_delta'] = {
+                    'cpu_memory': final_memory.get('cpu_memory', 0) - self.data['initial_memory'].get('cpu_memory', 0),
+                    'gpu_memory': final_memory.get('gpu_memory', 0) - self.data['initial_memory'].get('gpu_memory', 0)
+                }
+
+            self.log_profiling_stop()
+
+        except Exception as e:
+            self.logger.error(f"Error stopping TensorFlow profiling: {str(e)}")
+            raise
+
+    def _wrapped_call(self, *args, **kwargs):
+        """
+        Wrapped call method for profiling model inference.
+        Captures timing and memory metrics for each forward pass.
+
+        Returns:
+            The result of the original call method
+        """
+        try:
+            # Start metrics collection
+            self.time_tracker.start('model_call')
+
+            # Forward pass
+            result = self.original_call(*args, **kwargs)
+
+            # Stop timing
+            self.time_tracker.stop('model_call')
+
+            # Add metrics to data collection
+            key = f"inference_{len([k for k in self.data.keys() if k.startswith('inference_')])}"
+            self.data[key] = {
+                'time': self.time_tracker.get_duration('model_call'),
+                'timestamp': time.time()
+            }
+
+            return result
+
+        except Exception as e:
+            self.logger.error(f"Error in wrapped call: {str(e)}")
+            raise
+
+    def _wrapped_fit(self, *args, **kwargs):
+        """
+        Wrapped fit method for profiling model training.
+
+        Returns:
+            The result of the original fit method
+        """
+        self.time_tracker.start('model_fit')
+
+        # Apply callback to monitor each epoch
+        callbacks = kwargs.get('callbacks', [])
+        monitoring_callback = self._create_monitoring_callback()
+        callbacks.append(monitoring_callback)
+        kwargs['callbacks'] = callbacks
+
+        # Call original fit method
+        result = self._original_fit(*args, **kwargs)
+
+        self.time_tracker.stop('model_fit')
+        self.data['training'] = {
+            'total_time': self.time_tracker.get_duration('model_fit'),
+            'epochs': result.history.get('epochs', len(result.history.get('loss', []))),
+            'history': {k: [float(v) for v in vals] for k, vals in result.history.items()}
+        }
+
+        return result
+
+    def _wrapped_predict(self, *args, **kwargs):
+        """
+        Wrapped predict method for profiling inference.
+
+        Returns:
+            The result of the original predict method
+        """
+        self.time_tracker.start('model_predict')
+
+        result = self._original_predict(*args, **kwargs)
+
+        self.time_tracker.stop('model_predict')
+        self.data['prediction'] = {
+            'time': self.time_tracker.get_duration('model_predict'),
+            'batch_size': len(args[0]) if args and hasattr(args[0], '__len__') else None,
+            'timestamp': time.time()
+        }
+
+        return result
+
+    def _wrapped_evaluate(self, *args, **kwargs):
+        """
+        Wrapped evaluate method for profiling evaluation.
+
+        Returns:
+            The result of the original evaluate method
+        """
+        self.time_tracker.start('model_evaluate')
+
+        result = self._original_evaluate(*args, **kwargs)
+
+        self.time_tracker.stop('model_evaluate')
+
+        # Format metrics based on result type
+        if isinstance(result, list):
+            metrics = {}
+            # Get metric names from model.metrics_names if available
+            if hasattr(self.model, 'metrics_names'):
+                for i, name in enumerate(self.model.metrics_names):
+                    if i < len(result):
+                        metrics[name] = float(result[i])
+            else:
+                # Fallback if metrics_names not available
+                for i, value in enumerate(result):
+                    metrics[f'metric_{i}'] = float(value)
+        else:
+            # Single metric result
+            metrics = {'loss': float(result)}
+
+        self.data['evaluation'] = {
+            'time': self.time_tracker.get_duration('model_evaluate'),
+            'metrics': metrics,
+            'timestamp': time.time()
+        }
+
+        return result
+
+    def _create_monitoring_callback(self):
+        """
+        Create a TensorFlow callback to monitor training progress.
+
+        Returns:
+            tf.keras.callbacks.Callback: A custom callback
+        """
+        class ProfilingCallback(keras.callbacks.Callback):
+            def __init__(self, adapter):
+                super().__init__()
+                self.adapter = adapter
+                self.epoch_times = []
+                self.batch_times = []
+                self.current_epoch_start = None
+                self.current_batch_start = None
+
+            def on_epoch_begin(self, epoch, logs=None):
+                self.current_epoch_start = time.time()
+                self.adapter.logger.debug(f"Starting epoch {epoch+1}")
+
+            def on_epoch_end(self, epoch, logs=None):
+                if self.current_epoch_start:
+                    epoch_time = time.time() - self.current_epoch_start
+                    self.epoch_times.append(epoch_time)
+
+                    # Record metrics for this epoch
+                    self.adapter.data[f'epoch_{epoch}'] = {
+                        'time': epoch_time,
+                        'metrics': {k: float(v) for k, v in (logs or {}).items()}
+                    }
+
+                    self.adapter.logger.debug(f"Epoch {epoch+1} completed in {epoch_time:.2f}s")
+
+            def on_batch_begin(self, batch, logs=None):
+                self.current_batch_start = time.time()
+
+            def on_batch_end(self, batch, logs=None):
+                if self.current_batch_start:
+                    batch_time = time.time() - self.current_batch_start
+                    self.batch_times.append(batch_time)
+
+        return ProfilingCallback(self)
+
+    async def _get_initial_memory(self) -> Dict[str, float]:
+        """
+        Get initial memory usage before profiling.
+
+        Returns:
+            Dict[str, float]: Memory usage statistics
+        """
+        cpu_memory = self.cpu_tracker.get_peak_memory() if hasattr(self.cpu_tracker, 'get_peak_memory') else {}
+        gpu_memory = await self.gpu_tracker.get_peak_memory() if self.gpu_tracker else 0
+
+        return {
+            'cpu_memory': cpu_memory.get('rss', 0) if isinstance(cpu_memory, dict) else 0,
+            'gpu_memory': gpu_memory
+        }
+
+    async def _get_final_memory(self) -> Dict[str, float]:
+        """
+        Get final memory usage after profiling.
+
+        Returns:
+            Dict[str, float]: Memory usage statistics
+        """
+        cpu_memory = self.cpu_tracker.get_peak_memory() if hasattr(self.cpu_tracker, 'get_peak_memory') else {}
+        gpu_memory = await self.gpu_tracker.get_peak_memory() if self.gpu_tracker else 0
+
+        return {
+            'cpu_memory': cpu_memory.get('rss', 0) if isinstance(cpu_memory, dict) else 0,
+            'gpu_memory': gpu_memory
+        }
+
+    async def profile_inference(self, input_data: Any) -> Dict[str, Any]:
+        """
+        Profile the inference process for a single input.
+
+        Args:
+            input_data: Input data for model inference
+
+        Returns:
+            Dict[str, Any]: Profiling metrics for the inference operation
+        """
+        if not self._is_profiling:
+            await self.start_profiling()
+            local_profiling = True
+        else:
+            local_profiling = False
+
+        try:
+            self.time_tracker.start('inference')
             output = self.model(input_data)
-            end_time = time.perf_counter()
+            self.time_tracker.stop('inference')
 
-            inference_time = end_time - start_time
-            profiling_data = self.data.copy()
-            profiling_data['inference_time'] = inference_time
+            inference_time = self.time_tracker.get_duration('inference')
+
+            # Get current memory usage
+            cpu_memory = self.cpu_tracker.get_peak_memory() if hasattr(self.cpu_tracker, 'get_peak_memory') else {}
+            gpu_memory = await self.gpu_tracker.get_current_memory() if self.gpu_tracker else 0
+
+            profiling_data = {
+                'inference_time': inference_time,
+                'cpu_memory': cpu_memory.get('rss', 0) if isinstance(cpu_memory, dict) else 0,
+                'gpu_memory': gpu_memory,
+                'input_shape': self._get_shape(input_data),
+                'output_shape': self._get_shape(output),
+                'timestamp': time.time()
+            }
+
+            # Store in the instance data
+            key = f"inference_{len([k for k in self.data.keys() if k.startswith('inference_')])}"
+            self.data[key] = profiling_data
 
             return profiling_data
-        finally:
-            await self.stop_profiling()
 
-    async def profile_training_step(self, input_data: tf.Tensor, target: tf.Tensor) -> Dict[str, Any]:
-        """Profile a single training step."""
-        await self.start_profiling()
+        finally:
+            if local_profiling:
+                await self.stop_profiling()
+
+    def _get_shape(self, tensor_data):
+        """Get shape of tensor data safely."""
         try:
-            optimizer = self.model.optimizer
-            loss_function = self.model.loss
+            if hasattr(tensor_data, 'shape'):
+                return list(tensor_data.shape)
+            elif isinstance(tensor_data, (list, tuple)) and tensor_data and hasattr(tensor_data[0], 'shape'):
+                return [list(t.shape) for t in tensor_data]
+            return None
+        except:
+            return None
 
-            if optimizer is None or loss_function is None:
-                raise ValueError("Optimizer or loss function not properly configured")
+    async def profile_training_step(self, input_data: Any, target: Any) -> Dict[str, Any]:
+        """
+        Profile a single training step.
 
-            start_time = time.perf_counter()
-            with tf.GradientTape() as tape:
-                predictions = self.model(input_data, training=True)
-                loss = loss_function(target, predictions)
-            gradients = tape.gradient(loss, self.model.trainable_variables)
-            optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
-            end_time = time.perf_counter()
+        Args:
+            input_data: Input data for training
+            target: Target/label data for training
 
-            step_time = end_time - start_time
-            profiling_data = self.data.copy()
-            profiling_data['step_time'] = step_time
-            profiling_data['loss'] = loss.numpy().item()
+        Returns:
+            Dict[str, Any]: Profiling metrics for the training step
+        """
+        if not self._is_profiling:
+            await self.start_profiling()
+            local_profiling = True
+        else:
+            local_profiling = False
 
-            return profiling_data
+        try:
+            # Verify model is compiled
+            if not hasattr(self.model, 'optimizer') or self.model.optimizer is None:
+                raise MemoraithError("Model must be compiled before training")
+
+            # Use model's training step if available (for custom models), otherwise use GradientTape
+            self.time_tracker.start('training_step')
+
+            if hasattr(self.model, 'train_step'):
+                # Custom training step method is available
+                packed_data = self._pack_data(input_data, target)
+                result = self.model.train_step(packed_data)
+            else:
+                # Use manual training step with GradientTape
+                with tf.GradientTape() as tape:
+                    predictions = self.model(input_data, training=True)
+                    loss = self.model.compiled_loss(target, predictions)
+
+                gradients = tape.gradient(loss, self.model.trainable_variables)
+                self.model.optimizer.apply_gradients(zip(gradients, self.model.trainable_variables))
+
+                # Compute metrics
+                self.model.compiled_metrics.update_state(target, predictions)
+                result = {m.name: m.result().numpy() for m in self.model.metrics}
+                result['loss'] = float(loss.numpy())
+
+            self.time_tracker.stop('training_step')
+
+            # Get memory info
+            cpu_memory = self.cpu_tracker.get_peak_memory() if hasattr(self.cpu_tracker, 'get_peak_memory') else {}
+            gpu_memory = await self.gpu_tracker.get_current_memory() if self.gpu_tracker else 0
+
+            training_data = {
+                'step_time': self.time_tracker.get_duration('training_step'),
+                'loss': float(result['loss']) if 'loss' in result else None,
+                'metrics': {k: float(v) if hasattr(v, 'numpy') else float(v) for k, v in result.items() if k != 'loss'},
+                'cpu_memory': cpu_memory.get('rss', 0) if isinstance(cpu_memory, dict) else 0,
+                'gpu_memory': gpu_memory,
+                'timestamp': time.time()
+            }
+
+            # Store in instance data
+            key = f"train_step_{len([k for k in self.data.keys() if k.startswith('train_step_')])}"
+            self.data[key] = training_data
+
+            return training_data
+
         finally:
-            await self.stop_profiling()
+            if local_profiling:
+                await self.stop_profiling()
+
+    def _pack_data(self, x, y):
+        """Pack input and target data as expected by model.train_step."""
+        if isinstance(x, dict) and y is None:
+            return x  # Data already in expected format
+        return (x, y)
 
     async def get_model_summary(self) -> Dict[str, Any]:
-        """Get a summary of the model architecture."""
+        """
+        Get a comprehensive summary of the model architecture.
+
+        Returns:
+            Dict[str, Any]: Model architecture summary
+        """
         summary = {}
-        total_params = self.model.count_params()
-        trainable_params = sum(tf.keras.backend.count_params(w) for w in self.model.trainable_weights)
 
-        summary['total_params'] = total_params
-        summary['trainable_params'] = trainable_params
-        summary['non_trainable_params'] = total_params - trainable_params
-        summary['model_size_mb'] = total_params * 4 / (1024 * 1024)  # Assuming float32
+        try:
+            # Get basic model info
+            if hasattr(self.model, 'count_params'):
+                total_params = self.model.count_params()
+                trainable_params = sum(keras.backend.count_params(w) for w in self.model.trainable_weights)
+                non_trainable_params = total_params - trainable_params
 
-        return summary
+                summary['total_params'] = int(total_params)
+                summary['trainable_params'] = int(trainable_params)
+                summary['non_trainable_params'] = int(non_trainable_params)
 
-    async def get_layer_info(self, layer_name: str) -> Dict[str, Any]:
-        """Get detailed information about a specific layer."""
-        for layer in self.model.layers:
-            if layer.name == layer_name:
-                return {
-                    'type': type(layer).__name__,
-                    'parameters': layer.count_params(),
-                    'trainable_parameters': sum(tf.keras.backend.count_params(w) for w in layer.trainable_weights),
-                    'input_shape': layer.input_shape,
-                    'output_shape': layer.output_shape,
-                    'activation': layer.activation.__name__ if hasattr(layer, 'activation') else None,
+            # Get input and output shapes
+            if hasattr(self.model, 'input_shape'):
+                summary['input_shape'] = list(self.model.input_shape)
+
+            if hasattr(self.model, 'output_shape'):
+                summary['output_shape'] = list(self.model.output_shape)
+
+            # Get layer information
+            if hasattr(self.model, 'layers'):
+                layers_info = []
+                for layer in self.model.layers:
+                    layer_info = {
+                        'name': layer.name,
+                        'type': layer.__class__.__name__,
+                        'params': layer.count_params(),
+                        'trainable': layer.trainable,
+                        'input_shape': list(layer.input_shape) if hasattr(layer, 'input_shape') else None,
+                        'output_shape': list(layer.output_shape) if hasattr(layer, 'output_shape') else None,
+                    }
+                    layers_info.append(layer_info)
+                summary['layers'] = layers_info
+
+            # Get optimizer info
+            if hasattr(self.model, 'optimizer') and self.model.optimizer:
+                optimizer = self.model.optimizer
+                summary['optimizer'] = {
+                    'name': optimizer.__class__.__name__,
+                    'learning_rate': float(keras.backend.get_value(optimizer.lr)) if hasattr(optimizer, 'lr') else None,
+                    'parameters': {k: v for k, v in optimizer.get_config().items() if k != 'name'}
                 }
-        return {}
 
-    async def profile_memory_usage(self) -> Dict[str, float]:
-        """Profile the memory usage of the model."""
-        tf.keras.backend.clear_session()
+            # Get loss function info
+            if hasattr(self.model, 'loss') and self.model.loss:
+                loss = self.model.loss
+                if callable(loss):
+                    summary['loss'] = {'name': loss.__name__}
+                elif isinstance(loss, str):
+                    summary['loss'] = {'name': loss}
+                else:
+                    summary['loss'] = {'name': loss.__class__.__name__}
 
-        initial_mem = tf.config.experimental.get_memory_info('GPU:0')['current'] if tf.test.is_gpu_available() else 0
+            # Calculate model size estimation
+            if hasattr(self.model, 'weights'):
+                size_bytes = sum(keras.backend.count_params(w) * 4 for w in self.model.weights)  # Assuming float32
+                summary['model_size_mb'] = size_bytes / (1024 * 1024)
 
-        # Profile memory usage during forward pass
-        dummy_input = tf.random.normal(shape=[1] + self.model.input_shape[1:])
-        self.model(dummy_input)
-        forward_mem = tf.config.experimental.get_memory_info('GPU:0')['current'] if tf.test.is_gpu_available() else 0
+            return summary
 
-        # Profile memory usage during backward pass
-        with tf.GradientTape() as tape:
-            predictions = self.model(dummy_input)
-            loss = tf.reduce_mean(predictions)
-        _ = tape.gradient(loss, self.model.trainable_variables)
-        backward_mem = tf.config.experimental.get_memory_info('GPU:0')['current'] if tf.test.is_gpu_available() else 0
+        except Exception as e:
+            self.logger.error(f"Error generating model summary: {str(e)}")
+            return {'error': str(e)}
 
-        return {
-            'initial_memory': initial_mem / (1024 * 1024),  # Convert to MB
-            'forward_pass_memory': (forward_mem - initial_mem) / (1024 * 1024),
-            'backward_pass_memory': (backward_mem - forward_mem) / (1024 * 1024),
-            'total_memory': (backward_mem - initial_mem) / (1024 * 1024)
-        }
+    async def cleanup(self) -> None:
+        """
+        Clean up resources used during profiling.
+        Restores original model methods and clears session if needed.
+        """
+        try:
+            # Restore original methods if not already done
+            if self.original_call:
+                self.model.call = self.original_call
+                self.original_call = None
 
-    def get_flops(self) -> int:
-        """Calculate the total number of FLOPs for the model."""
-        run_meta = tf.compat.v1.RunMetadata()
-        opts = tf.compat.v1.profiler.ProfileOptionBuilder.float_operation()
-        flops = tf.compat.v1.profiler.profile(tf.compat.v1.get_default_graph(), run_meta=run_meta, cmd='scope', options=opts)
-        return flops.total_float_ops
+            if self._original_fit:
+                self.model.fit = self._original_fit
+                self._original_fit = None
 
-    async def get_current_time(self) -> float:
-        """Get the current time in a high-precision format."""
-        return time.perf_counter()
+            if self._original_predict:
+                self.model.predict = self._original_predict
+                self._original_predict = None
 
-    async def export_model(self, path: str, format: str) -> None:
-        """Export the model to a specified format."""
-        if format.lower() == 'savedmodel':
-            tf.saved_model.save(self.model, path)
-        elif format.lower() == 'h5':
-            self.model.save(path, save_format='h5')
-        else:
-            raise ValueError(f"Unsupported export format: {format}")
-        self.logger.info(f"Model exported to {format} format at {path}")
+            if self._original_evaluate:
+                self.model.evaluate = self._original_evaluate
+                self._original_evaluate = None
 
-    async def visualize_model(self, output_path: str) -> None:
-        """Generate a visual representation of the model architecture."""
-        tf.keras.utils.plot_model(self.model, to_file=output_path, show_shapes=True, show_layer_names=True)
-        self.logger.info(f"Model visualization saved to {output_path}")
+            # Clear TensorFlow session if needed
+            if keras and hasattr(keras.backend, 'clear_session'):
+                keras.backend.clear_session()
 
-    async def get_optimizer_info(self) -> Dict[str, Any]:
-        """Get information about the current optimizer."""
-        optimizer = self.model.optimizer
-        return {
-            'name': optimizer.__class__.__name__,
-            'learning_rate': float(tf.keras.backend.get_value(optimizer.lr)),
-            'parameters': {k: v.numpy() for k, v in optimizer.get_config().items() if k != 'name'}
-        }
+            self.logger.info("TensorFlow adapter resources cleaned up")
+        except Exception as e:
+            self.logger.error(f"Error during cleanup: {str(e)}")
 
-    async def get_loss_function_info(self) -> Dict[str, Any]:
-        """Get information about the current loss function."""
-        loss = self.model.loss
-        if callable(loss):
-            return {'name': loss.__name__}
-        elif isinstance(loss, str):
-            return {'name': loss}
-        elif isinstance(loss, tf.keras.losses.Loss):
-            return {
-                'name': loss.__class__.__name__,
-                'parameters': loss.get_config()
-            }
-        else:
-            return {'error': 'Unknown loss type'}
+    async def validate_model(self) -> bool:
+        """
+        Validate the TensorFlow model.
+
+        Returns:
+            bool: True if the model is valid, False otherwise
+        """
+        try:
+            # Check if it's a proper TensorFlow model
+            if not hasattr(self.model, 'call'):
+                self.logger.error("Model does not have a 'call' method")
+                return False
+
+            # Verify model is built/has weights
+            if not hasattr(self.model, 'weights') or not self.model.weights:
+                self.logger.warning("Model does not have weights (not built)")
+
+            # Check if the model has been compiled
+            if hasattr(self.model, 'compiled_loss') and self.model.compiled_loss is None:
+                self.logger.warning("Model has not been compiled")
+
+            return True
+        except Exception as e:
+            self.logger.error(f"Model validation failed: {str(e)}")
+            return False
