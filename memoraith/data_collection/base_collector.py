@@ -21,13 +21,13 @@ class BaseDataCollector(ABC):
         try:
             async with self._lock:
                 if self._is_collecting:
-                    raise DataCollectionError("Collection already running")
+                    raise DataCollectionError("Collection already running", details="Data collection process is already active")
                 self._is_collecting = True
                 self._task = asyncio.create_task(self._collection_loop())
                 self.logger.info(f"{self.__class__.__name__} started collecting data")
         except Exception as e:
             self.logger.error(f"Failed to start collection: {str(e)}")
-            raise DataCollectionError(f"Start failed: {str(e)}")
+            raise DataCollectionError("Start failed", details=str(e))
 
     async def stop(self) -> None:
         """Stop data collection."""
@@ -46,7 +46,7 @@ class BaseDataCollector(ABC):
                 self.logger.info(f"{self.__class__.__name__} stopped collecting data")
         except Exception as e:
             self.logger.error(f"Failed to stop collection: {str(e)}")
-            raise DataCollectionError(f"Stop failed: {str(e)}")
+            raise DataCollectionError("Stop failed", details=str(e))
 
     @abstractmethod
     async def _collect_data(self) -> Dict[str, Any]:

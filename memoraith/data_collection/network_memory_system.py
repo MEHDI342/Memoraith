@@ -148,6 +148,36 @@ class NetworkMetrics(MetricCollector):
             self.is_collecting = False
             raise NetworkError(f"Failed to start network collection: {str(e)}") from e
 
+    async def _save_state(self, state: str) -> None:
+        """
+        Save profiler state to disk for monitoring and recovery.
+
+        Args:
+            state: Current operational state
+        """
+        try:
+            state_file = self.storage_path / "profiler_state.json"
+            state_data = {
+                "timestamp": time.time(),
+                "state": state,
+                "collection_start_time": self.start_time,
+                "samples_collected": len(self.metrics),
+                "config": {k: str(v) if isinstance(v, Path) else v
+                           for k, v in self.config.__dict__.items() if not k.startswith('_')}
+            }
+
+            # Atomic write using temporary file
+            temp_file = state_file.with_suffix('.tmp')
+            with open(temp_file, 'w') as f:
+                json.dump(state_data, f, indent=2)
+
+            # Atomic rename
+            temp_file.replace(state_file)
+            self.logger.debug(f"Network metrics state saved: {state}")
+
+        except (OSError, IOError) as e:
+            self.logger.warning(f"Failed to save state: {str(e)}")
+
     async def stop(self) -> Dict[str, Any]:
         """Stop network metrics collection and return results"""
         try:
@@ -214,223 +244,42 @@ class NetworkMetrics(MetricCollector):
                 self.logger.error(f"Error in sync network collection: {e}", exc_info=True)
                 time.sleep(1)
 
-    async def _calculate_metrics(
-            self,
-            last_counters: psutil._common.snetio,
-            current_counters: psutil._common.snetio
-    ) -> Dict[str, Any]:
-        """Calculate network metrics between two counter states"""
-        metrics = {
-            'timestamp': time.time(),
-            'bytes_sent': current_counters.bytes_sent - last_counters.bytes_sent,
-            'bytes_recv': current_counters.bytes_recv - last_counters.bytes_recv,
-            'packets_sent': current_counters.packets_sent - last_counters.packets_sent,
-            'packets_recv': current_counters.packets_recv - last_counters.packets_recv,
-            'bandwidth_mbps': (
-                    (current_counters.bytes_sent + current_counters.bytes_recv -
-                     last_counters.bytes_sent - last_counters.bytes_recv) * 8 /
-                    (1024 * 1024 * self.config.interval)
-            )
-        }
+    def _should_alert_sync(self, metrics: Dict[str, Any]) -> bool:
+        """
+        Check if metrics should trigger an alert in synchronous mode.
 
-        if self.config.detailed:
-            metrics.update({
-                'errin': current_counters.errin - last_counters.errin,
-                'errout': current_counters.errout - last_counters.errout,
-                'dropin': current_counters.dropin - last_counters.dropin,
-                'dropout': current_counters.dropout - last_counters.dropout,
-                'error_rate': self._calculate_error_rate(
-                    current_counters, last_counters
-                )
-            })
+        Args:
+            metrics: Current metrics data point
 
-        return metrics
-
-    def _calculate_metrics_sync(
-            self,
-            last_counters: psutil._common.snetio,
-            current_counters: psutil._common.snetio
-    ) -> Dict[str, Any]:
-        """Synchronous version of metrics calculation"""
-        return {
-            'timestamp': time.time(),
-            'bytes_sent': current_counters.bytes_sent - last_counters.bytes_sent,
-            'bytes_recv': current_counters.bytes_recv - last_counters.bytes_recv,
-            'packets_sent': current_counters.packets_sent - last_counters.packets_sent,
-            'packets_recv': current_counters.packets_recv - last_counters.packets_recv,
-            'bandwidth_mbps': (
-                    (current_counters.bytes_sent + current_counters.bytes_recv -
-                     last_counters.bytes_sent - last_counters.bytes_recv) * 8 /
-                    (1024 * 1024 * self.config.interval)
-            )
-        }
-
-    async def _store_metrics(self, metrics: Dict[str, Any]) -> None:
-        """Store network metrics with async file writing"""
-        async with self._async_lock:
-            self.metrics.append(metrics)
-
-            if self.config.enable_disk_logging:
-                file_path = self.storage_path / f"network_metrics_{int(self.start_time)}.json"
-                async with aiofiles.open(file_path, 'a') as f:
-                    await f.write(json.dumps(metrics) + '\n')
-
-                if self.config.compression_enabled:
-                    await self._compress_old_metrics()
-
-    def _store_metrics_sync(self, metrics: Dict[str, Any]) -> None:
-        """Synchronous version of metrics storage"""
-        with self._lock:
-            self.metrics.append(metrics)
-
-            if self.config.enable_disk_logging:
-                file_path = self.storage_path / f"network_metrics_{int(self.start_time)}.json"
-                with open(file_path, 'a') as f:
-                    json.dump(metrics, f)
-                    f.write('\n')
-
-    async def _should_alert(self, metrics: Dict[str, Any]) -> bool:
-        """Check if metrics should trigger an alert"""
+        Returns:
+            bool: True if alert threshold exceeded
+        """
         if not self.config.alert_enabled:
             return False
 
-        return (
-                metrics['bandwidth_mbps'] > self.config.network_threshold_mbps or
-                metrics.get('error_rate', 0) > 0.1  # 10% error rate threshold
-        )
+        # Check primary bandwidth threshold
+        if metrics['bandwidth_mbps'] > self.config.network_threshold_mbps:
+            return True
 
-    async def _send_alert(self, metrics: Dict[str, Any]) -> None:
-        """Send alert for concerning metrics"""
+        # Check error rate if detailed metrics enabled
+        if self.config.detailed_metrics and metrics.get('error_rate', 0) > 5.0:  # 5% error rate
+            return True
+
+        return False
+
+    def _send_alert_sync(self, metrics: Dict[str, Any]) -> None:
+        """
+        Send alert for concerning metrics in synchronous mode.
+
+        Args:
+            metrics: Metrics that triggered the alert
+        """
         alert_message = (
             f"Network Alert: Bandwidth {metrics['bandwidth_mbps']:.2f} Mbps "
             f"exceeds threshold {self.config.network_threshold_mbps} Mbps"
         )
         self.logger.warning(alert_message)
         # Additional alert mechanisms could be added here (email, SMS, etc.)
-
-    async def _compress_old_metrics(self) -> None:
-        """Compress old metric files to save space"""
-        import gzip
-        import shutil
-
-        for file_path in self.storage_path.glob("*.json"):
-            if time.time() - file_path.stat().st_mtime > 86400:  # 24 hours
-                gz_path = file_path.with_suffix('.json.gz')
-                with open(file_path, 'rb') as f_in:
-                    with gzip.open(gz_path, 'wb') as f_out:
-                        shutil.copyfileobj(f_in, f_out)
-                file_path.unlink()
-
-    async def _generate_report(self) -> Dict[str, Any]:
-        """Generate comprehensive network metrics report"""
-        if not self.metrics:
-            return self._generate_empty_report()
-
-        total_metrics = self._calculate_total_metrics()
-        peak_metrics = self._calculate_peak_metrics()
-        average_metrics = self._calculate_average_metrics()
-
-        report = {
-            'start_time': self.start_time,
-            'end_time': time.time(),
-            'duration': time.time() - self.start_time,
-            'total_samples': len(self.metrics),
-            'total_metrics': total_metrics,
-            'peak_metrics': peak_metrics,
-            'average_metrics': average_metrics,
-            'bandwidth_statistics': self._calculate_bandwidth_statistics(),
-            'error_statistics': self._calculate_error_statistics()
-        }
-
-        # Save report to disk
-        report_path = self.storage_path / f"network_report_{int(self.start_time)}.json"
-        async with aiofiles.open(report_path, 'w') as f:
-            await f.write(json.dumps(report, indent=2))
-
-        return report
-
-    def _generate_empty_report(self) -> Dict[str, Any]:
-        """Generate empty report when no metrics collected"""
-        return {
-            'start_time': self.start_time,
-            'end_time': time.time(),
-            'duration': time.time() - self.start_time,
-            'total_samples': 0,
-            'error': 'No metrics collected during the session'
-        }
-
-    def _calculate_error_rate(
-            self,
-            current: psutil._common.snetio,
-            last: psutil._common.snetio
-    ) -> float:
-        """Calculate error rate between two counter states"""
-        total_packets = (
-                (current.packets_sent + current.packets_recv) -
-                (last.packets_sent + last.packets_recv)
-        )
-
-        if total_packets == 0:
-            return 0.0
-
-        total_errors = (
-                (current.errin + current.errout + current.dropin + current.dropout) -
-                (last.errin + last.errout + last.dropin + last.dropout)
-        )
-
-        return (total_errors / total_packets) * 100 if total_packets > 0 else 0
-
-    def _calculate_total_metrics(self) -> Dict[str, Any]:
-        """Calculate total metrics for the session"""
-        return {
-            key: sum(m[key] for m in self.metrics if key != 'timestamp')
-            for key in self.metrics[0].keys()
-            if key != 'timestamp'
-        }
-
-    def _calculate_peak_metrics(self) -> Dict[str, Any]:
-        """Calculate peak metrics for the session"""
-        return {
-            key: max(m[key] for m in self.metrics if key != 'timestamp')
-            for key in self.metrics[0].keys()
-            if key != 'timestamp'
-        }
-
-    def _calculate_average_metrics(self) -> Dict[str, Any]:
-        """Calculate average metrics for the session"""
-        total = self._calculate_total_metrics()
-        sample_count = len(self.metrics)
-        return {
-            key: value / sample_count
-            for key, value in total.items()
-        }
-
-    def _calculate_bandwidth_statistics(self) -> Dict[str, float]:
-        """Calculate detailed bandwidth statistics"""
-        bandwidth_samples = [m['bandwidth_mbps'] for m in self.metrics]
-        return {
-            'peak_bandwidth_mbps': max(bandwidth_samples),
-            'average_bandwidth_mbps': np.mean(bandwidth_samples),
-            'median_bandwidth_mbps': np.median(bandwidth_samples),
-            'std_bandwidth_mbps': np.std(bandwidth_samples),
-            'p95_bandwidth_mbps': np.percentile(bandwidth_samples, 95),
-            'p99_bandwidth_mbps': np.percentile(bandwidth_samples, 99)
-        }
-
-    def _calculate_error_statistics(self) -> Dict[str, float]:
-        """Calculate detailed error statistics"""
-        if not self.config.detailed:
-            return {}
-
-        error_samples = [m.get('error_rate', 0) for m in self.metrics]
-        return {
-            'peak_error_rate': max(error_samples),
-            'average_error_rate': np.mean(error_samples),
-            'total_errors': sum(
-                m['errin'] + m['errout'] + m['dropin'] + m['dropout']
-                for m in self.metrics
-            )
-        }
 
 class MemoryMetrics(MetricCollector):
     """Memory metrics collection implementation"""
@@ -473,6 +322,36 @@ class MemoryMetrics(MetricCollector):
             self.logger.error(f"Failed to start memory metrics collection: {e}", exc_info=True)
             self.is_collecting = False
             raise MemoryError(f"Failed to start memory collection: {str(e)}") from e
+
+    async def _save_state(self, state: str) -> None:
+        """
+        Save profiler state to disk for monitoring and recovery.
+
+        Args:
+            state: Current operational state
+        """
+        try:
+            state_file = self.storage_path / "profiler_state.json"
+            state_data = {
+                "timestamp": time.time(),
+                "state": state,
+                "collection_start_time": self.start_time,
+                "samples_collected": len(self.metrics),
+                "config": {k: str(v) if isinstance(v, Path) else v
+                           for k, v in self.config.__dict__.items() if not k.startswith('_')}
+            }
+
+            # Atomic write using temporary file
+            temp_file = state_file.with_suffix('.tmp')
+            with open(temp_file, 'w') as f:
+                json.dump(state_data, f, indent=2)
+
+            # Atomic rename
+            temp_file.replace(state_file)
+            self.logger.debug(f"Memory metrics state saved: {state}")
+
+        except (OSError, IOError) as e:
+            self.logger.warning(f"Failed to save state: {str(e)}")
 
     async def stop(self) -> Dict[str, Any]:
         """Stop memory metrics collection and return results"""
@@ -547,53 +426,54 @@ class MemoryMetrics(MetricCollector):
             'process_percent': self.process.memory_percent()
         }
 
-        if self.config.detailed:
+        if self.config.detailed_metrics:
             metrics.update(await self._get_detailed_memory_metrics())
 
         return metrics
 
-    async def _get_detailed_memory_metrics(self) -> Dict[str, Any]:
-        """Get detailed memory metrics including memory maps"""
-        detailed_metrics = {}
+    def _get_memory_metrics_sync(self) -> Dict[str, Any]:
+        """
+        Get current memory metrics for synchronous operation.
 
-        try:
-            memory_maps = self.process.memory_maps(grouped=True)
-            detailed_metrics.update({
-                'shared': sum(m.shared for m in memory_maps) / (1024 * 1024),  # MB
-                'private': sum(m.private for m in memory_maps) / (1024 * 1024),  # MB
-                'swap': sum(m.swap for m in memory_maps) / (1024 * 1024),  # MB
-            })
-        except Exception as e:
-            self.logger.warning(f"Could not collect detailed memory metrics: {e}")
+        Returns:
+            Dict[str, Any]: Memory metrics data point
+        """
+        process_memory = self.process.memory_info()
+        system_memory = psutil.virtual_memory()
 
-        return detailed_metrics
+        metrics = {
+            'timestamp': time.time(),
+            'rss': process_memory.rss / (1024 * 1024),  # MB
+            'vms': process_memory.vms / (1024 * 1024),  # MB
+            'system_total': system_memory.total / (1024 * 1024),  # MB
+            'system_available': system_memory.available / (1024 * 1024),  # MB
+            'system_percent': system_memory.percent,
+            'process_percent': self.process.memory_percent()
+        }
 
-    async def _store_metrics(self, metrics: Dict[str, Any]) -> None:
-        """Store memory metrics with async file writing"""
-        async with self._async_lock:
-            self.metrics.append(metrics)
+        if self.config.detailed_metrics:
+            try:
+                memory_maps = self.process.memory_maps(grouped=True)
+                metrics.update({
+                    'shared': sum(m.shared for m in memory_maps) / (1024 * 1024),  # MB
+                    'private': sum(m.private for m in memory_maps) / (1024 * 1024),  # MB
+                    'swap': sum(m.swap for m in memory_maps) / (1024 * 1024),  # MB
+                })
+            except Exception as e:
+                self.logger.warning(f"Could not collect detailed memory metrics: {e}")
 
-            if self.config.enable_disk_logging:
-                file_path = self.storage_path / f"memory_metrics_{int(self.start_time)}.json"
-                async with aiofiles.open(file_path, 'a') as f:
-                    await f.write(json.dumps(metrics) + '\n')
+        return metrics
 
-                if self.config.compression_enabled:
-                    await self._compress_old_metrics()
+    def _should_alert_sync(self, metrics: Dict[str, Any]) -> bool:
+        """
+        Check if metrics should trigger an alert in synchronous mode.
 
-    def _store_metrics_sync(self, metrics: Dict[str, Any]) -> None:
-        """Synchronous version of metrics storage"""
-        with self._lock:
-            self.metrics.append(metrics)
+        Args:
+            metrics: Current metrics data point
 
-            if self.config.enable_disk_logging:
-                file_path = self.storage_path / f"memory_metrics_{int(self.start_time)}.json"
-                with open(file_path, 'a') as f:
-                    json.dump(metrics, f)
-                    f.write('\n')
-
-    async def _should_alert(self, metrics: Dict[str, Any]) -> bool:
-        """Check if metrics should trigger an alert"""
+        Returns:
+            bool: True if alert threshold exceeded
+        """
         if not self.config.alert_enabled:
             return False
 
@@ -602,27 +482,19 @@ class MemoryMetrics(MetricCollector):
                 metrics['system_percent'] > 90  # System memory usage above 90%
         )
 
-    async def _send_alert(self, metrics: Dict[str, Any]) -> None:
-        """Send alert for concerning metrics"""
+    def _send_alert_sync(self, metrics: Dict[str, Any]) -> None:
+        """
+        Send alert for concerning metrics in synchronous mode.
+
+        Args:
+            metrics: Metrics that triggered the alert
+        """
         alert_message = (
             f"Memory Alert: Process memory usage {metrics['rss']:.2f} MB "
             f"exceeds threshold {self.config.memory_threshold_mb} MB"
         )
         self.logger.warning(alert_message)
         # Additional alert mechanisms could be added here
-
-    async def _compress_old_metrics(self) -> None:
-        """Compress old metric files to save space"""
-        import gzip
-        import shutil
-
-        for file_path in self.storage_path.glob("*.json"):
-            if time.time() - file_path.stat().st_mtime > 86400:  # 24 hours
-                gz_path = file_path.with_suffix('.json.gz')
-                with open(file_path, 'rb') as f_in:
-                    with gzip.open(gz_path, 'wb') as f_out:
-                        shutil.copyfileobj(f_in, f_out)
-                file_path.unlink()
 
     async def _generate_report(self) -> Dict[str, Any]:
         """Generate comprehensive memory metrics report"""
@@ -651,28 +523,88 @@ class MemoryMetrics(MetricCollector):
 
         return report
 
-    def _calculate_memory_statistics(self) -> Dict[str, Any]:
-        """Calculate detailed memory statistics"""
-        rss_samples = [m['rss'] for m in self.metrics]
-        system_percent_samples = [m['system_percent'] for m in self.metrics]
+    def _generate_empty_report(self) -> Dict[str, Any]:
+        """
+        Generate empty report when no metrics were collected.
 
+        Returns:
+            Dict[str, Any]: Empty report structure with metadata
+        """
         return {
-            'rss_statistics': {
-                'peak_mb': max(rss_samples),
-                'average_mb': np.mean(rss_samples),
-                'median_mb': np.median(rss_samples),
-                'std_mb': np.std(rss_samples),
-                'p95_mb': np.percentile(rss_samples, 95),
-                'p99_mb': np.percentile(rss_samples, 99)
-            },
-            'system_memory_statistics': {
-                'peak_percent': max(system_percent_samples),
-                'average_percent': np.mean(system_percent_samples),
-                'median_percent': np.median(system_percent_samples),
-                'std_percent': np.std(system_percent_samples),
-                'time_above_90_percent': len([x for x in system_percent_samples if x > 90])
+            'start_time': self.start_time,
+            'end_time': time.time(),
+            'duration': time.time() - (self.start_time or time.time()),
+            'total_samples': 0,
+            'error': 'No metrics collected during the session',
+            'statistics': {
+                'peak_memory_mb': 0,
+                'average_memory_mb': 0,
+                'peak_system_percent': 0
             }
         }
+
+    def _calculate_total_metrics(self) -> Dict[str, Any]:
+        """
+        Calculate total metrics from collected data points.
+
+        Returns:
+            Dict[str, Any]: Aggregated total metrics
+        """
+        return {
+            key: sum(m[key] for m in self.metrics if key != 'timestamp' and key in m)
+            for key in ['rss', 'vms', 'shared', 'private', 'swap']
+            if any(key in m for m in self.metrics)
+        }
+
+    def _calculate_peak_metrics(self) -> Dict[str, Any]:
+        """
+        Calculate peak values for each metric.
+
+        Returns:
+            Dict[str, Any]: Peak values for all metrics
+        """
+        # Create a set of all possible metric keys except timestamp
+        all_keys = set()
+        for m in self.metrics:
+            all_keys.update(k for k in m.keys() if k != 'timestamp')
+
+        # Calculate peak values for each metric
+        peaks = {}
+        for key in all_keys:
+            try:
+                peaks[key] = max(m.get(key, 0) for m in self.metrics)
+            except (ValueError, TypeError):
+                # Skip metrics that can't be compared numerically
+                continue
+
+        return peaks
+
+    def _calculate_average_metrics(self) -> Dict[str, Any]:
+        """
+        Calculate average values for each metric.
+
+        Returns:
+            Dict[str, Any]: Average values for all metrics
+        """
+        # Create a set of all possible metric keys except timestamp
+        all_keys = set()
+        for m in self.metrics:
+            all_keys.update(k for k in m.keys() if k != 'timestamp')
+
+        # Calculate averages for each metric
+        averages = {}
+        for key in all_keys:
+            try:
+                values = [m.get(key, 0) for m in self.metrics if key in m]
+                if values:
+                    averages[key] = sum(values) / len(values)
+                else:
+                    averages[key] = 0
+            except (ValueError, TypeError):
+                # Skip metrics that can't be averaged
+                continue
+
+        return averages
 
 class ProfilingManager:
     """Main class for managing both network and memory profiling"""

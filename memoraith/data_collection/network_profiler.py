@@ -679,7 +679,7 @@ class NetworkProfiler:
                                     self.logger.debug("Deleted old file %s", file_path.name)
                             except (ValueError, IndexError):
                                 # Couldn't parse timestamp, use file modification time as fallback
-                                if file_path.stat().st_mtime < threshold_threshold:
+                                if file_path.stat().st_mtime < threshold_timestamp:
                                     file_path.unlink()
                     except OSError as e:
                         self.logger.warning("Error cleaning up file %s: %s", file_path.name, str(e))

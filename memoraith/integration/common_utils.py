@@ -4,15 +4,27 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Import TensorFlow with error handling for the functions that need it
+try:
+    import tensorflow as tf
+    TENSORFLOW_AVAILABLE = True
+except ImportError:
+    TENSORFLOW_AVAILABLE = False
+    logger.debug("TensorFlow not available, some functionalities will be limited")
+    # Create a placeholder tf object to prevent errors
+    class TensorFlowPlaceholder:
+        class keras:
+            class backend:
+                @staticmethod
+                def count_params(w):
+                    return 0
+
+    tf = TensorFlowPlaceholder()
+
 def identify_framework(model: Any) -> str:
     """
-    Identify the deep learning framework of the given model.
-
-    Args:
-        model: The machine learning model to identify
-
-    Returns:
-        str: The identified framework name ('pytorch', 'tensorflow', 'unknown')
+    Args:model: The machine learning model to identify
+    Returns = str: The identified framework name ('pytorch', 'tensorflow', 'unknown')
     """
     try:
         model_type = type(model).__module__.split('.')[0]
@@ -64,13 +76,18 @@ def _get_pytorch_structure(model: Any) -> Dict[str, Any]:
 
 def _get_tensorflow_structure(model: Any) -> Dict[str, Any]:
     """Helper function to get TensorFlow model structure."""
+    if not TENSORFLOW_AVAILABLE:
+        return {'error': 'TensorFlow not available'}
+
     structure = {}
-    for layer in model.layers:
-        structure[layer.name] = {
-            'type': type(layer).__name__,
-            'parameters': layer.count_params(),
-            'trainable': sum(tf.keras.backend.count_params(w) for w in layer.trainable_weights)
-        }
+    # Check if it's a Keras model
+    if hasattr(model, 'layers'):
+        for layer in model.layers:
+            structure[layer.name] = {
+                'type': type(layer).__name__,
+                'parameters': layer.count_params(),
+                'trainable': sum(tf.keras.backend.count_params(w) for w in layer.trainable_weights)
+            }
     return structure
 
 def estimate_model_size(model: Any) -> Dict[str, float]:
@@ -106,21 +123,23 @@ def _estimate_pytorch_size(model: Any) -> Dict[str, float]:
 
 def _estimate_tensorflow_size(model: Any) -> Dict[str, float]:
     """Helper function to estimate TensorFlow model size."""
-    param_size = sum(tf.keras.backend.count_params(w) * w.dtype.size for w in model.weights)
-    return {
-        'parameters': param_size / (1024 * 1024),
-        'buffers': 0  # TensorFlow doesn't have a direct equivalent to PyTorch's buffers
-    }
+    if not TENSORFLOW_AVAILABLE:
+        return {'parameters': 0, 'buffers': 0}
+
+    # Estimate using weights if available
+    if hasattr(model, 'weights'):
+        # TensorFlow doesn't directly expose element size, assume float32 (4 bytes)
+        param_bytes = sum(tf.keras.backend.count_params(w) * 4 for w in model.weights)
+        return {
+            'parameters': param_bytes / (1024 * 1024),
+            'buffers': 0  # TensorFlow doesn't have a direct equivalent to PyTorch's buffers
+        }
+    return {'parameters': 0, 'buffers': 0}
 
 def get_function_info(func: callable) -> Dict[str, Any]:
     """
-    Get detailed information about a function.
-
-    Args:
-        func: The function to inspect
-
-    Returns:
-        Dict[str, Any]: Information about the function
+    Args       func: The function to inspect
+    Returns   Dict[str, Any]: Information about the function
     """
     try:
         signature = inspect.signature(func)

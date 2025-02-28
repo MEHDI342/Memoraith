@@ -27,6 +27,8 @@ class ProfilingError(MemoraithError):
         message = f"Profiling error in {component}: {details}"
         super().__init__(message)
 
+
+
 class DataCollectionError(MemoraithError):
     """Exception raised when there's an error collecting profiling data."""
     def __init__(self, data_type: str, details: str):
