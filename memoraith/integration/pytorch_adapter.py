@@ -1460,6 +1460,44 @@ class PyTorchAdapter(FrameworkAdapter):
                 'category': 'error'
             }]
 
+        def __del__(self):
+            """
+            Ensure proper cleanup of resources when the adapter is garbage collected.
+
+            Implements a failsafe cleanup mechanism for CUDA events and hooks.
+            """
+        try:
+            # Cleanup hooks if they weren't already removed
+            if hasattr(self, '_original_hooks') and self._original_hooks:
+                try:
+                    self._remove_hooks()
+                except Exception as e:
+                    if hasattr(self, 'logger'):
+                        self.logger.warning(f"Error during hook cleanup in __del__: {e}")
+
+            # Explicitly clear CUDA events dictionary
+            if hasattr(self, 'cuda_events') and self.cuda_events:
+                self.cuda_events.clear()
+
+            # Force garbage collection to release CUDA resources
+            if self._is_cuda_available:
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass  # Ignore errors during cache clearing
+
+            # Clear any remaining large data structures
+            if hasattr(self, 'layer_profiles'):
+                self.layer_profiles.clear()
+            if hasattr(self, 'training_history'):
+                self.training_history.clear()
+            if hasattr(self, 'memory_traces'):
+                self.memory_traces.clear()
+
+        except Exception:
+            # Never raise exceptions in __del__
+            pass
+
     async def profile_inference(self, input_data: torch.Tensor) -> Dict[str, Any]:
         """
         Profile a single inference pass with comprehensive metrics.
@@ -2003,6 +2041,8 @@ class PyTorchAdapter(FrameworkAdapter):
 
         except Exception as e:
             self.logger.error(f"Error during adapter cleanup: {str(e)}", exc_info=True)
+
+
 
 class nullcontext:
     """

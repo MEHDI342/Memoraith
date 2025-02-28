@@ -23,20 +23,47 @@ except ImportError:
 
 def identify_framework(model: Any) -> str:
     """
-    Args:model: The machine learning model to identify
-    Returns = str: The identified framework name ('pytorch', 'tensorflow', 'unknown')
+    Identify the deep learning framework of a model with enhanced detection.
+
+    Args:
+        model: The machine learning model to identify
+
+    Returns:
+        str: The identified framework name ('pytorch', 'tensorflow', 'unknown')
     """
     try:
+        # Check for PyTorch models by inheritance and attributes
+        if hasattr(model, 'parameters') and hasattr(model, 'forward'):
+            return 'pytorch'
+
+        # Check module type for standard imported models
         model_type = type(model).__module__.split('.')[0]
         if model_type == 'torch':
             return 'pytorch'
-        elif model_type in ['tensorflow', 'keras']:
+        elif model_type in ['tensorflow', 'keras', 'tf']:
             return 'tensorflow'
-        else:
-            logger.warning(f"Unknown framework for model type: {model_type}")
-            return 'unknown'
+
+        # Deeper inspection for models with different module origins
+        if hasattr(model, '__class__'):
+            # Check class inheritance for PyTorch models
+            for base in model.__class__.__mro__:
+                base_module = base.__module__.split('.')[0]
+                if base_module == 'torch':
+                    return 'pytorch'
+                elif base_module in ['tensorflow', 'keras', 'tf']:
+                    return 'tensorflow'
+
+        # Last resort check for common attributes
+        if all(hasattr(model, attr) for attr in ['__call__', 'trainable_variables']):
+            return 'tensorflow'
+
+        logger.warning(f"Unknown framework for model type: {model_type}")
+        return 'unknown'
     except Exception as e:
         logger.error(f"Error identifying framework: {str(e)}")
+        # Default to error-resistant type detection
+        if hasattr(model, 'forward') and callable(getattr(model, 'forward')):
+            return 'pytorch'
         return 'unknown'
 
 def get_model_structure(model: Any) -> Dict[str, Any]:

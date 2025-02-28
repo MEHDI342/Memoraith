@@ -363,86 +363,137 @@ class NetworkProfiler:
 
     def _calculate_metrics(self, last_counters: Any, current_counters: Any) -> Dict[str, Any]:
         """
-        Calculate comprehensive network metrics between counter states.
+        Calculate comprehensive network metrics between counter states with robust error handling.
 
         Args:
             last_counters: Previous network counter state
             current_counters: Current network counter state
 
         Returns:
-            Dict[str, Any]: Calculated metrics
+            Dict[str, Any]: Calculated metrics or fallback metrics on error
         """
-        # Calculate time delta for accurate rate calculations
-        current_time = time.time()
-        time_delta = (current_time - self._collection_start_time if len(self._metrics) == 0
-                      else current_time - self._metrics[-1]['timestamp'] if self._metrics
-        else self.config.interval)
+        try:
+            # Validate input counters
+            if last_counters is None or current_counters is None:
+                raise ValueError("Missing network counter data")
 
-        # Ensure we don't divide by zero
-        if time_delta < 0.001:
-            time_delta = 0.001
+            # Validate counter attributes
+            required_attributes = ['bytes_sent', 'bytes_recv', 'packets_sent', 'packets_recv']
+            for attr in required_attributes:
+                if not hasattr(last_counters, attr) or not hasattr(current_counters, attr):
+                    raise AttributeError(f"Network counter missing required attribute: {attr}")
 
-        # Basic metrics calculation
-        bytes_sent = current_counters.bytes_sent - last_counters.bytes_sent
-        bytes_recv = current_counters.bytes_recv - last_counters.bytes_recv
-        packets_sent = current_counters.packets_sent - last_counters.packets_sent
-        packets_recv = current_counters.packets_recv - last_counters.packets_recv
+            # Calculate time delta for accurate rate calculations
+            current_time = time.time()
+            time_delta = None
 
-        # Handle counter rollover (unsigned integers)
-        if bytes_sent < 0:
-            bytes_sent = current_counters.bytes_sent
-        if bytes_recv < 0:
-            bytes_recv = current_counters.bytes_recv
-        if packets_sent < 0:
-            packets_sent = current_counters.packets_sent
-        if packets_recv < 0:
-            packets_recv = current_counters.packets_recv
+            # Determine time delta based on available context
+            if len(self._metrics) == 0:
+                # First data point
+                if hasattr(self, '_collection_start_time') and self._collection_start_time is not None:
+                    time_delta = current_time - self._collection_start_time
+                else:
+                    time_delta = self.config.interval
+            elif self._metrics:
+                # Use time since last measurement
+                try:
+                    last_measurement = next(reversed(self._metrics.values())) if isinstance(self._metrics, dict) else self._metrics[-1]
+                    if 'timestamp' in last_measurement:
+                        time_delta = current_time - last_measurement['timestamp']
+                except (StopIteration, IndexError):
+                    pass
 
-        # Calculate bandwidth in Mbps (megabits per second)
-        bandwidth_mbps = ((bytes_sent + bytes_recv) * 8) / (time_delta * 1024 * 1024)
+            # Fallback to configured interval if time_delta couldn't be determined
+            if time_delta is None or time_delta <= 0:
+                time_delta = self.config.interval
 
-        metrics = {
-            'timestamp': current_time,
-            'bytes_sent': bytes_sent,
-            'bytes_recv': bytes_recv,
-            'packets_sent': packets_sent,
-            'packets_recv': packets_recv,
-            'bandwidth_mbps': bandwidth_mbps,
-            'packet_rate': (packets_sent + packets_recv) / time_delta
-        }
+            # Ensure minimum time delta to prevent division by zero
+            time_delta = max(0.001, time_delta)  # 1ms minimum
 
-        # Add detailed metrics if configured
-        if self.config.detailed_metrics:
-            errors_in = current_counters.errin - last_counters.errin
-            errors_out = current_counters.errout - last_counters.errout
-            drops_in = current_counters.dropin - last_counters.dropin
-            drops_out = current_counters.dropout - last_counters.dropout
+            # Handle counter rollover with unsigned integers
+            bytes_sent = current_counters.bytes_sent - last_counters.bytes_sent
+            bytes_recv = current_counters.bytes_recv - last_counters.bytes_recv
+            packets_sent = current_counters.packets_sent - last_counters.packets_sent
+            packets_recv = current_counters.packets_recv - last_counters.packets_recv
 
-            # Handle counter rollover
-            if errors_in < 0: errors_in = current_counters.errin
-            if errors_out < 0: errors_out = current_counters.errout
-            if drops_in < 0: drops_in = current_counters.dropin
-            if drops_out < 0: drops_out = current_counters.dropout
+            # Handle counter wraparound/rollover for 32-bit unsigned integers
+            if bytes_sent < 0: bytes_sent = current_counters.bytes_sent
+            if bytes_recv < 0: bytes_recv = current_counters.bytes_recv
+            if packets_sent < 0: packets_sent = current_counters.packets_sent
+            if packets_recv < 0: packets_recv = current_counters.packets_recv
 
-            # Calculate error rates
-            total_packets = packets_sent + packets_recv
-            if total_packets > 0:
-                error_rate = (errors_in + errors_out + drops_in + drops_out) / total_packets * 100
-            else:
-                error_rate = 0.0
+            # Calculate bandwidth in Mbps (megabits per second)
+            total_bytes = bytes_sent + bytes_recv
+            bandwidth_mbps = (total_bytes * 8) / (time_delta * 1024 * 1024)
 
-            metrics.update({
-                'errin': errors_in,
-                'errout': errors_out,
-                'dropin': drops_in,
-                'dropout': drops_out,
-                'error_rate': error_rate,
-                'average_packet_size': ((bytes_sent + bytes_recv) / total_packets) if total_packets > 0 else 0,
-                'bytes_sent_rate': bytes_sent / time_delta,
-                'bytes_recv_rate': bytes_recv / time_delta
-            })
+            # Build base metrics dictionary
+            metrics = {
+                'timestamp': current_time,
+                'bytes_sent': bytes_sent,
+                'bytes_recv': bytes_recv,
+                'packets_sent': packets_sent,
+                'packets_recv': packets_recv,
+                'bandwidth_mbps': bandwidth_mbps,
+                'packet_rate': (packets_sent + packets_recv) / time_delta,
+                'measurement_interval': time_delta
+            }
 
-        return metrics
+            # Add detailed metrics if configured and available
+            if hasattr(self, 'config') and getattr(self.config, 'detailed_metrics', False):
+                detailed_attrs = ['errin', 'errout', 'dropin', 'dropout']
+                if all(hasattr(last_counters, attr) and hasattr(current_counters, attr) for attr in detailed_attrs):
+                    # Calculate error and drop metrics with rollover handling
+                    errors_in = current_counters.errin - last_counters.errin
+                    errors_out = current_counters.errout - last_counters.errout
+                    drops_in = current_counters.dropin - last_counters.dropin
+                    drops_out = current_counters.dropout - last_counters.dropout
+
+                    # Handle counter wraparound/rollover
+                    if errors_in < 0: errors_in = current_counters.errin
+                    if errors_out < 0: errors_out = current_counters.errout
+                    if drops_in < 0: drops_in = current_counters.dropin
+                    if drops_out < 0: drops_out = current_counters.dropout
+
+                    # Calculate error rates and avoid division by zero
+                    total_packets = packets_sent + packets_recv
+                    error_rate = (errors_in + errors_out + drops_in + drops_out) / total_packets * 100 if total_packets > 0 else 0.0
+
+                    # Add detailed metrics to results
+                    metrics.update({
+                        'errin': errors_in,
+                        'errout': errors_out,
+                        'dropin': drops_in,
+                        'dropout': drops_out,
+                        'error_rate': error_rate,
+                        'average_packet_size': total_bytes / total_packets if total_packets > 0 else 0,
+                        'bytes_sent_rate': bytes_sent / time_delta,
+                        'bytes_recv_rate': bytes_recv / time_delta,
+                        'errors_total': errors_in + errors_out,
+                        'drops_total': drops_in + drops_out
+                    })
+
+            # Add metadata about calculation
+            metrics['calculation_time'] = time.time() - current_time
+
+            return metrics
+
+        except Exception as e:
+            # Log detailed error with stacktrace for diagnostics
+            self.logger.error(f"Error calculating network metrics: {str(e)}", exc_info=True)
+
+            # Return minimal failsafe metrics to prevent collection interruption
+            return {
+                'timestamp': time.time(),
+                'error': str(e),
+                'error_type': type(e).__name__,
+                'bytes_sent': 0,
+                'bytes_recv': 0,
+                'packets_sent': 0,
+                'packets_recv': 0,
+                'bandwidth_mbps': 0.0,
+                'is_error_state': True,
+                'needs_reset': isinstance(e, (AttributeError, ValueError))
+            }
 
     def _update_statistics(self, metrics: Dict[str, Any]) -> None:
         """

@@ -32,6 +32,7 @@ class CPUMemoryTracker:
         self.logger.info("CPU memory tracking stopped")
 
     def _track_memory(self) -> None:
+        """Track CPU memory usage with robust error handling and compatibility."""
         process = psutil.Process()
         while not self._stop_event.is_set():
             try:
@@ -43,12 +44,40 @@ class CPUMemoryTracker:
                 }
 
                 if self.detailed:
-                    mem_maps = process.memory_maps(grouped=True)
-                    mem_data.update({
-                        'shared': sum(m.shared for m in mem_maps) / (1024 * 1024),
-                        'private': sum(m.private for m in mem_maps) / (1024 * 1024),
-                        'swap': sum(m.swap for m in mem_maps) / (1024 * 1024),
-                    })
+                    try:
+                        # Use safe attribute access with compatibility layer
+                        mem_maps = process.memory_maps(grouped=True)
+
+                        # Modern psutil compatibility - different attribute structure
+                        if mem_maps and hasattr(mem_maps[0], 'shared'):
+                            mem_data.update({
+                                'shared': sum(m.shared for m in mem_maps) / (1024 * 1024),
+                                'private': sum(m.private for m in mem_maps) / (1024 * 1024),
+                                'swap': sum(getattr(m, 'swap', 0) for m in mem_maps) / (1024 * 1024),
+                            })
+                        # Handle newer psutil versions
+                        elif mem_maps and hasattr(mem_maps[0], 'lib'):
+                            # Alternative attributes in newer psutil versions
+                            mem_data.update({
+                                'shared': sum(getattr(m, 'lib', 0) for m in mem_maps) / (1024 * 1024),
+                                'private': sum(getattr(m, 'private', 0) for m in mem_maps) / (1024 * 1024),
+                                'swap': sum(getattr(m, 'swapped', 0) for m in mem_maps) / (1024 * 1024),
+                            })
+                        else:
+                            # Fallback when memory map details unavailable
+                            mem_data.update({
+                                'shared': 0.0,
+                                'private': 0.0,
+                                'swap': 0.0,
+                            })
+                    except Exception as mem_map_error:
+                        # Graceful degradation - continue with basic metrics
+                        self.logger.debug(f"Memory mapping data unavailable: {str(mem_map_error)}")
+                        mem_data.update({
+                            'shared': 0.0,
+                            'private': 0.0,
+                            'swap': 0.0,
+                        })
 
                 with self._lock:
                     self.memory_usage.append(mem_data)
